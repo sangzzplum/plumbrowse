@@ -18,12 +18,30 @@ fi
 
 BIN="$TARGET_DIR/plumbrowser"
 APP="$TARGET_DIR/PlumBrowser.app"
+ICON_PNG="$ROOT/assets/plumnet.png"
 
 mkdir -p "$APP/Contents/MacOS"
 cp "$BIN" "$APP/Contents/MacOS/plumbrowser"
 chmod +x "$APP/Contents/MacOS/plumbrowser"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+ICON_PLIST=""
+if [ -f "$ICON_PNG" ] && command -v iconutil >/dev/null && command -v sips >/dev/null; then
+  echo "→ building AppIcon.icns..."
+  ICONSET="$TARGET_DIR/AppIcon.iconset"
+  rm -rf "$ICONSET"
+  mkdir -p "$ICONSET"
+  for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$ICON_PNG" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+    size2=$((size * 2))
+    sips -z "$size2" "$size2" "$ICON_PNG" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+  done
+  mkdir -p "$APP/Contents/Resources"
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+  rm -rf "$ICONSET"
+  ICON_PLIST=$'  <key>CFBundleIconFile</key>\n  <string>AppIcon</string>\n'
+fi
+
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -44,7 +62,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <string>0.1.0</string>
   <key>CFBundleVersion</key>
   <string>0.1.0</string>
-  <key>LSMinimumSystemVersion</key>
+${ICON_PLIST}  <key>LSMinimumSystemVersion</key>
   <string>11.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>

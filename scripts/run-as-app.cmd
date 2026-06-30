@@ -1,5 +1,4 @@
 @echo off
-setlocal
 cd /d "%~dp0.."
 
 if /I "%~1"=="release" (
@@ -14,4 +13,5 @@ if /I "%~1"=="release" (
   start "" "%CD%\target\debug\plumbrowser.exe"
 )
 
-endlocal
+rem Закрываем окно cmd — браузер уже запущен отдельным процессом.
+exit /b 0

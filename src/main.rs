@@ -1,10 +1,14 @@
+//! PlumBrowser — лёгкий кросс-платформенный браузер на Rust.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use serde_json::json;
 use std::borrow::Cow;
+use std::path::PathBuf;
 use tao::{
     dpi::PhysicalSize,
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
-    window::{Window, WindowBuilder},
+    window::{Icon, Window, WindowBuilder},
 };
 use wry::{
     dpi::{LogicalPosition, LogicalSize},
@@ -55,6 +59,14 @@ fn focus_active_tab(tabs: &[Tab], current: usize) {
     if let Some(tab) = tabs.get(current) {
         let _ = tab.webview.focus();
     }
+}
+
+fn load_window_icon() -> Option<Icon> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/plumnet.png");
+    let img = image::open(&path).ok()?;
+    let img = img.to_rgba8();
+    let (w, h) = img.dimensions();
+    Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
 fn webview_go_back(webview: &WebView) {
@@ -611,6 +623,10 @@ fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
     let mut builder = WindowBuilder::new()
         .with_title("PlumBrowser")
         .with_inner_size(LogicalSize::new(1200.0, 800.0));
+
+    if let Some(icon) = load_window_icon() {
+        builder = builder.with_window_icon(Some(icon));
+    }
 
     #[cfg(target_os = "macos")]
     {
