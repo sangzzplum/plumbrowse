@@ -16,8 +16,7 @@ fn main() {
 #[cfg(target_os = "windows")]
 fn embed_windows_icon(png: &Path) {
     use std::fs::File;
-    use std::path::PathBuf;
-    use ico::{IconDir, IconDirEntry, ResourceType};
+    use ico::{IconDir, IconDirEntry, IconImage, ResourceType};
     use image::imageops::FilterType;
     use image::GenericImageView;
 
@@ -34,7 +33,8 @@ fn embed_windows_icon(png: &Path) {
         let rgba = img
             .resize_exact(size, size, FilterType::Lanczos3)
             .to_rgba8();
-        let entry = IconDirEntry::encode_as_png(&rgba).expect("encode icon png");
+        let icon_image = IconImage::from_rgba_data(size, size, rgba.into_raw());
+        let entry = IconDirEntry::encode_as_png(&icon_image).expect("encode icon png");
         icon_dir.add_entry(entry);
     }
 
@@ -43,8 +43,12 @@ fn embed_windows_icon(png: &Path) {
     let file = File::create(&ico_path).expect("create ico");
     icon_dir.write(file).expect("write ico");
 
+    let ico_path = ico_path
+        .to_str()
+        .expect("Windows icon path must be valid UTF-8");
+
     winresource::WindowsResource::new()
-        .set_icon(ico_path.to_string_lossy())
+        .set_icon(ico_path)
         .set("ProductName", "PlumBrowser")
         .set("FileDescription", "PlumBrowser")
         .compile()

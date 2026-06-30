@@ -38,7 +38,9 @@ if [ -f "$ICON_PNG" ] && command -v iconutil >/dev/null && command -v sips >/dev
   mkdir -p "$APP/Contents/Resources"
   iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
   rm -rf "$ICONSET"
-  ICON_PLIST=$'  <key>CFBundleIconFile</key>\n  <string>AppIcon</string>\n'
+  ICON_PLIST=$'  <key>CFBundleIconFile</key>\n  <string>AppIcon</string>\n  <key>CFBundleIconName</key>\n  <string>AppIcon</string>\n'
+else
+  echo "→ icon skipped (need assets/plumnet.png + sips + iconutil)"
 fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST

@@ -69,6 +69,37 @@ fn load_window_icon() -> Option<Icon> {
     Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
+/// Dock / панель задач на macOS — иконка окна сама по себе её не меняет.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::AnyThread;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSString;
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/plumnet.png");
+    let Some(path_str) = path.to_str() else {
+        return;
+    };
+
+    let ns_path = NSString::from_str(path_str);
+    let Some(image) = NSImage::initWithContentsOfFile(NSImage::alloc(), &ns_path) else {
+        return;
+    };
+
+    let app = NSApplication::sharedApplication(mtm);
+    unsafe {
+        app.setApplicationIconImage(Some(&image));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_icon() {}
+
 fn webview_go_back(webview: &WebView) {
     #[cfg(target_os = "macos")]
     {
@@ -652,6 +683,7 @@ fn main() {
     let proxy = event_loop.create_proxy();
 
     let window = build_window(&event_loop);
+    set_dock_icon();
 
     let (mut ww, mut wh) = logical_size(&window);
 
