@@ -1,4 +1,6 @@
 # Собирает PlumBrowser и запускает exe отдельно от PowerShell.
+# Если политика блокирует .ps1, используй: scripts\run-as-app.cmd
+# Или: powershell -ExecutionPolicy Bypass -File .\scripts\run-as-app.ps1
 param(
     [switch]$Release
 )

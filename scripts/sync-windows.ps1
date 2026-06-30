@@ -10,4 +10,4 @@ git pull origin main
 Write-Host "→ cargo build..."
 cargo build
 
-Write-Host "Готово. Запуск: cargo run  или  .\scripts\run-as-app.ps1"
+Write-Host "Готово. Запуск: scripts\run-as-app.cmd  или  cargo run"
