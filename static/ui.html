@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PlumBrowser</title>
+    <style>
+        body { margin: 0; font-family: Arial; padding: 10px; }
+        .toolbar { background: #f0f0f0; padding: 10px; }
+        input { width: 400px; padding: 5px; }
+        button { padding: 5px 10px; margin: 0 5px; }
+        .tabs { display: flex; background: #ddd; padding: 5px; }
+        .tab { padding: 8px 12px; cursor: pointer; border-radius: 4px 4px 0 0; }
+        .tab.active { background: white; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="toolbar">
+        <div class="tabs" id="tabs"></div>
+        <button onclick="newTab()">+ Новая вкладка</button>
+    </div>
+    <input type="text" id="urlbar" placeholder="URL" style="width: 500px; padding: 5px;">
+    <button onclick="loadUrl()">Перейти</button>
+    <script>
+        function safePost(cmd, url = 'https://google.com') {
+            window.chrome?.webview?.postMessage(cmd + ':' + url);
+        }
+        
+        // Только безопасные URL!
+        function loadUrl() { 
+            safePost('load', 'https://plumnet.ru'); 
+        }
+        function newTab() { 
+            safePost('new_tab'); 
+        }
+    </script>
+</body>
+</html>
