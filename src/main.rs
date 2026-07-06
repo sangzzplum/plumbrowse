@@ -49,8 +49,18 @@ fn toolbar_height() -> f64 {
 #[cfg(target_os = "windows")]
 fn log_windows_layout(toolbar: &WebView, tabs: &[Tab], label: &str) {
     use std::io::Write;
-    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    fn write_rect(file: &mut std::fs::File, name: &str, hwnd: HWND) {
+        let mut rect = RECT::default();
+        let ok = unsafe { GetWindowRect(hwnd, &mut rect).is_ok() };
+        let _ = writeln!(
+            file,
+            "{name}: hwnd={:?} rect=({},{})-({},{}) ok={ok}",
+            hwnd.0, rect.left, rect.top, rect.right, rect.bottom
+        );
+    }
 
     let path = std::env::temp_dir().join("plumbrowser_debug.log");
     let Ok(mut file) = std::fs::OpenOptions::new()
@@ -62,24 +72,14 @@ fn log_windows_layout(toolbar: &WebView, tabs: &[Tab], label: &str) {
     };
 
     let _ = writeln!(file, "\n=== {label} ===");
-    let write_rect = |name: &str, hwnd: windows::Win32::Foundation::HWND| {
-        let mut rect = RECT::default();
-        let ok = unsafe { GetWindowRect(hwnd, &mut rect).is_ok() };
-        let _ = writeln!(
-            file,
-            "{name}: hwnd={:?} rect=({},{})-({},{}) ok={ok}",
-            hwnd.0, rect.left, rect.top, rect.right, rect.bottom
-        );
-    };
-
     if let Some(hwnd) = webview_host_hwnd(toolbar) {
-        write_rect("toolbar", hwnd);
+        write_rect(&mut file, "toolbar", hwnd);
     } else {
         let _ = writeln!(file, "toolbar: no hwnd");
     }
     for (i, tab) in tabs.iter().enumerate() {
         if let Some(hwnd) = webview_host_hwnd(&tab.webview) {
-            write_rect(&format!("content[{i}]"), hwnd);
+            write_rect(&mut file, &format!("content[{i}]"), hwnd);
         }
     }
     let _ = writeln!(file, "log: {}", path.display());
