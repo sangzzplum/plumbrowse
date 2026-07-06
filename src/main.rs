@@ -21,9 +21,6 @@ use wry::{
 use tao::platform::macos::WindowBuilderExtMacOS;
 
 #[cfg(target_os = "windows")]
-use tao::platform::windows::WindowExtWindows;
-
-#[cfg(target_os = "windows")]
 use wry::WebViewBuilderExtWindows;
 
 fn logical_size(window: &Window) -> (f64, f64) {
@@ -126,11 +123,26 @@ fn webview_go_back(webview: &WebView) {
 }
 
 fn open_docked_devtools(webview: &WebView) {
+    #[cfg(not(target_os = "windows"))]
     webview.open_devtools();
+    #[cfg(target_os = "windows")]
+    let _ = webview;
 }
 
 fn close_docked_devtools(webview: &WebView) {
+    #[cfg(not(target_os = "windows"))]
     webview.close_devtools();
+    #[cfg(target_os = "windows")]
+    let _ = webview;
+}
+
+#[cfg(target_os = "windows")]
+fn sync_windows_devtools(panel: &WebView, tab: &Tab, open: bool) {
+    if open {
+        win_devtools::open_in_panel(panel, &tab.url);
+    } else {
+        win_devtools::close_panel(panel);
+    }
 }
 
 fn webview_go_forward(webview: &WebView) {
@@ -152,7 +164,6 @@ fn webview_go_forward(webview: &WebView) {
 }
 
 const NEWTAB_URL: &str = "plum://newtab";
-const TOOLBAR_URL: &str = "plum://toolbar/";
 const DEVTOOLS_WIDTH: f64 = 420.0;
 const TOOLBAR_BG: RGBA = (32, 33, 36, 255);
 
@@ -165,7 +176,9 @@ fn version_label() -> String {
 }
 
 fn toolbar_navigation_allowed(url: &str) -> bool {
-    url.starts_with("plum://toolbar")
+    !(url.starts_with("http://")
+        || url.starts_with("https://")
+        || url.starts_with("file://"))
 }
 
 /// Toolbar — это UI, не сайт.
@@ -179,6 +192,10 @@ const TOOLBAR_LOCK_SCRIPT: &str = r#"
   document.addEventListener('keydown', e => {
     const k = e.key.toLowerCase();
     if (e.key === 'F5' || ((e.metaKey || e.ctrlKey) && k === 'r')) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && k === 'i') || (e.metaKey && e.altKey && k === 'i')) {
       e.preventDefault();
       e.stopPropagation();
     }
@@ -321,15 +338,6 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
     let host = uri.host().unwrap_or_default();
     let path = uri.path();
 
-    if host == "toolbar" || path.starts_with("/toolbar") {
-        let html = toolbar_html();
-        return Response::builder()
-            .status(200)
-            .header(CONTENT_TYPE, "text/html; charset=utf-8")
-            .body(Cow::Owned(html.into_bytes()))
-            .unwrap();
-    }
-
     let (mime, body): (&str, Cow<'static, [u8]>) = match path {
         "/newtab" | "/newtab/" | "/" if host.is_empty() || host == "newtab" => (
             "text/html; charset=utf-8",
@@ -402,6 +410,16 @@ const TOOLBAR_SCRIPT: &str = r#"
 
       document.getElementById('addtab').addEventListener('click', () => post('new_tab:'));
 
+      const strip = document.getElementById('tab-strip');
+      if (strip) {
+        strip.addEventListener('wheel', (e) => {
+          if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+            strip.scrollLeft += e.deltaY;
+            e.preventDefault();
+          }
+        }, { passive: false });
+      }
+
       document.getElementById('back').addEventListener('click', () => post('nav_back'));
       document.getElementById('forward').addEventListener('click', () => post('nav_forward'));
       document.getElementById('reload').addEventListener('click', () => post('nav_reload'));
@@ -415,15 +433,61 @@ const TOOLBAR_SCRIPT: &str = r#"
       });
       urlInput.addEventListener('blur', () => post('focus_content'));
 
-      document.addEventListener('keydown', (e) => {
-        if (e.key === 'F12') {
-          e.preventDefault();
-          post('nav_devtools');
-        }
-      }, true);
-
       post('ready');
     });
+
+    const TAB_PREF = 168;
+    const TAB_MIN = 48;
+    const TAB_MAX = 220;
+    const TAB_GAP = 8;
+
+    function layoutTabs() {
+      const strip = document.getElementById('tab-strip');
+      const bar = strip.parentElement;
+      const addBtn = document.getElementById('addtab');
+      const dragFill = bar.querySelector('.drag-fill');
+      const tabs = [...strip.querySelectorAll('.tab')];
+      const n = tabs.length;
+      if (n === 0) return;
+
+      let reserved = addBtn.offsetWidth + TAB_GAP;
+      if (dragFill) reserved += dragFill.offsetWidth;
+      const avail = Math.max(0, bar.clientWidth - reserved);
+
+      strip.classList.remove('shrink', 'scroll');
+      const prefTotal = n * TAB_PREF + Math.max(0, n - 1) * TAB_GAP;
+      const minTotal = n * TAB_MIN + Math.max(0, n - 1) * TAB_GAP;
+
+      if (prefTotal <= avail) {
+        tabs.forEach(t => {
+          t.style.flex = '1 1 ' + TAB_PREF + 'px';
+          t.style.minWidth = '72px';
+          t.style.maxWidth = TAB_MAX + 'px';
+          t.style.width = '';
+        });
+      } else if (minTotal <= avail) {
+        strip.classList.add('shrink');
+        const each = Math.max(TAB_MIN, Math.floor((avail - Math.max(0, n - 1) * TAB_GAP) / n));
+        tabs.forEach(t => {
+          t.style.flex = '1 1 0';
+          t.style.minWidth = TAB_MIN + 'px';
+          t.style.maxWidth = 'none';
+          t.style.width = each + 'px';
+        });
+      } else {
+        strip.classList.add('scroll');
+        tabs.forEach(t => {
+          t.style.flex = '0 0 ' + TAB_MIN + 'px';
+          t.style.minWidth = TAB_MIN + 'px';
+          t.style.maxWidth = TAB_MIN + 'px';
+          t.style.width = TAB_MIN + 'px';
+        });
+        const active = strip.querySelector('.tab.active');
+        if (active) active.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+      }
+    }
+
+    window.addEventListener('resize', () => layoutTabs());
 
     window.__setState = function(tabTitles, tabUrls, current, url) {
       const strip = document.getElementById('tab-strip');
@@ -449,6 +513,7 @@ const TOOLBAR_SCRIPT: &str = r#"
       });
 
       document.getElementById('url').value = url || '';
+      layoutTabs();
     };
 
     window.__setTabTitle = function(index, title) {
@@ -463,13 +528,16 @@ const TOOLBAR_SCRIPT: &str = r#"
 const TAB_BAR_CSS: &str = r#"
     body { user-select:none; -webkit-user-select:none; }
     input { user-select:text; -webkit-user-select:text; }
-    .tabs-bar { display:flex; align-items:center; gap:8px; min-height:32px; }
+    .tabs-bar { display:flex; align-items:center; gap:8px; min-height:32px; width:100%; }
     .tab-strip {
       display:flex; gap:8px; align-items:center;
-      flex:0 1 auto; min-width:0; max-width:100%;
-      overflow-x:auto; overflow-y:hidden; scrollbar-width:none;
+      flex:1 1 auto; min-width:0;
+      overflow-x:auto; overflow-y:hidden;
+      scrollbar-width:thin; scrollbar-color:#5f6368 transparent;
     }
-    .tab-strip::-webkit-scrollbar { display:none; }
+    .tab-strip::-webkit-scrollbar { height:6px; }
+    .tab-strip::-webkit-scrollbar-thumb { background:#5f6368; border-radius:8px; }
+    .tab-strip::-webkit-scrollbar-track { background:transparent; }
     .addtab {
       width:36px; height:32px; border-radius:12px; background:var(--b);
       display:grid; place-items:center; cursor:pointer; user-select:none;
@@ -477,10 +545,9 @@ const TAB_BAR_CSS: &str = r#"
     }
     .addtab:hover { background:var(--b2); }
     .tab {
-      display:flex; align-items:center; gap:8px;
-      width:168px; min-width:72px; max-width:220px; height:32px;
-      padding:0 10px; border-radius:12px; background:var(--b);
-      cursor:pointer; user-select:none; flex:0 0 auto;
+      display:flex; align-items:center; gap:6px;
+      height:32px; padding:0 8px; border-radius:12px; background:var(--b);
+      cursor:pointer; user-select:none; box-sizing:border-box;
     }
     .tab.active { background:var(--b2); }
     .tab-title {
@@ -488,17 +555,13 @@ const TAB_BAR_CSS: &str = r#"
       text-overflow:ellipsis; flex:1 1 auto;
     }
     .tab-close {
-      flex:0 0 auto; width:26px; height:26px; border-radius:10px;
+      flex:0 0 auto; width:24px; height:24px; border-radius:10px;
       display:grid; place-items:center; color:var(--mut); font-weight:900;
     }
     .tab-close:hover { background:#2a2b2f; color:var(--fg); }
+    .tab-strip.scroll .tab-title { display:none; }
     .drag-fill {
-      flex:1 1 auto; min-width:32px; height:32px;
-      -webkit-app-region:drag;
-    }
-    .version {
-      flex:0 0 auto; font-size:11px; color:var(--mut);
-      padding:0 8px; white-space:nowrap; user-select:none;
+      flex:1 1 auto; min-width:24px; height:32px;
       -webkit-app-region:drag;
     }
 "#;
@@ -551,7 +614,6 @@ fn toolbar_html() -> String {
         <div class="tab-strip" id="tab-strip"></div>
         <div class="addtab" id="addtab" title="Новая вкладка">+</div>
         <div class="drag-fill"></div>
-        <div class="version">{version}</div>
       </div>
     </div>
     <div class="nav-row">
@@ -567,8 +629,7 @@ fn toolbar_html() -> String {
 </body>
 </html>"#,
             script = TOOLBAR_SCRIPT,
-            tab_bar_css = TAB_BAR_CSS,
-            version = version
+            tab_bar_css = TAB_BAR_CSS
         );
     }
 
@@ -712,7 +773,9 @@ fn build_content_webview(
         });
 
     #[cfg(target_os = "windows")]
-    let builder = builder.with_browser_accelerator_keys(false);
+    let builder = builder
+        .with_browser_accelerator_keys(false)
+        .with_additional_browser_args("--remote-debugging-port=9222");
 
     builder
         .build_as_child(window)
@@ -741,12 +804,8 @@ fn show_tab(
         if let Some(tab) = tabs.get(current) {
             open_docked_devtools(&tab.webview);
             #[cfg(target_os = "windows")]
-            {
-                win_devtools::close_floating_window();
-                win_devtools::embed_after_open(bounds_devtools_panel(ww, wh), window.scale_factor());
-                if let Some(panel) = devtools_panel {
-                    let _ = panel.set_visible(true);
-                }
+            if let Some(panel) = devtools_panel {
+                sync_windows_devtools(panel, tab, true);
             }
         }
     }
@@ -773,14 +832,6 @@ fn resize_all(
     if let Some(panel) = devtools_panel {
         let _ = panel.set_bounds(bounds_devtools_panel(ww, wh));
         let _ = panel.set_visible(devtools_open);
-        win_devtools::register_panel_host(
-            window.hwnd(),
-            bounds_devtools_panel(ww, wh),
-            window.scale_factor(),
-        );
-        if devtools_open {
-            win_devtools::reposition_embedded(bounds_devtools_panel(ww, wh), window.scale_factor());
-        }
     }
 }
 
@@ -814,18 +865,16 @@ fn toggle_devtools(
     if *devtools_open {
         close_docked_devtools(&tab.webview);
         #[cfg(target_os = "windows")]
-        win_devtools::close_floating_window();
+        if let Some(panel) = devtools_panel {
+            sync_windows_devtools(panel, tab, false);
+        }
         *devtools_open = false;
     } else {
         *devtools_open = true;
         open_docked_devtools(&tab.webview);
         #[cfg(target_os = "windows")]
-        {
-            if let Some(panel) = devtools_panel {
-                let _ = panel.set_visible(true);
-                let _ = panel.set_bounds(bounds_devtools_panel(ww, wh));
-            }
-            win_devtools::embed_after_open(bounds_devtools_panel(ww, wh), window.scale_factor());
+        if let Some(panel) = devtools_panel {
+            sync_windows_devtools(panel, tab, true);
         }
     }
 
@@ -849,7 +898,7 @@ fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
 
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
     let builder = WebViewBuilder::new()
-        .with_url(TOOLBAR_URL)
+        .with_html(toolbar_html())
         .with_bounds(bounds_toolbar(ww))
         .with_background_color(TOOLBAR_BG)
         .with_focused(false)
@@ -857,7 +906,6 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         .with_devtools(false)
         .with_hotkeys_zoom(false)
         .with_back_forward_navigation_gestures(false)
-        .with_custom_protocol("plum".to_string(), plum_protocol)
         .with_navigation_handler(|url| toolbar_navigation_allowed(&url))
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
         .with_initialization_script(TOOLBAR_LOCK_SCRIPT)
@@ -884,7 +932,9 @@ fn build_devtools_panel(window: &Window, ww: f64, wh: f64) -> WebView {
         .with_visible(false)
         .with_devtools(false)
         .with_hotkeys_zoom(false)
-        .with_navigation_handler(|_| false)
+        .with_navigation_handler(|url| {
+            url.starts_with("http://127.0.0.1:9222") || url.starts_with("about:")
+        })
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
         .with_default_context_menus(false)
         .with_browser_accelerator_keys(false)
@@ -938,7 +988,9 @@ fn open_new_tab(
     if devtools_open {
         open_docked_devtools(&tabs[*current].webview);
         #[cfg(target_os = "windows")]
-        win_devtools::embed_after_open(bounds_devtools_panel(ww, wh), window.scale_factor());
+        if let Some(panel) = devtools_panel {
+            sync_windows_devtools(panel, &tabs[*current], true);
+        }
     }
     sync_toolbar(toolbar, tabs, *current);
     resize_all(
@@ -1022,12 +1074,6 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     let devtools_panel = build_devtools_panel(&window, ww, wh);
-    #[cfg(target_os = "windows")]
-    win_devtools::register_panel_host(
-        window.hwnd(),
-        bounds_devtools_panel(ww, wh),
-        window.scale_factor(),
-    );
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -1318,231 +1364,63 @@ fn main() {
     });
 }
 
+
 #[cfg(target_os = "windows")]
 mod win_devtools {
-    use std::sync::atomic::{AtomicIsize, Ordering};
-    use std::thread;
-    use std::time::Duration;
+    use serde_json::Value;
+    use wry::WebView;
 
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
-    use windows::Win32::System::Threading::GetCurrentProcessId;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        EnumChildWindows, EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW,
-        GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, MoveWindow, PostMessageW,
-        SetParent, ShowWindow, GWL_STYLE, SW_SHOW, WM_CLOSE, WS_CHILD, WS_POPUP,
-    };
-    use wry::dpi::{PhysicalPosition, PhysicalSize};
-    use wry::Rect;
+    const CDP_BASE: &str = "http://127.0.0.1:9222";
 
-    static EMBEDDED_HWND: AtomicIsize = AtomicIsize::new(0);
-    static PANEL_HOST_HWND: AtomicIsize = AtomicIsize::new(0);
-
-    pub fn register_panel_host(main_hwnd: isize, panel: Rect, scale: f64) {
-        let target = rect_to_physical(panel, scale);
-        if let Some(hwnd) = find_child_near(main_hwnd, &target) {
-            PANEL_HOST_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
-        }
-    }
-
-    pub fn embed_after_open(panel: Rect, scale: f64) {
-        let parent_hwnd = PANEL_HOST_HWND.load(Ordering::SeqCst);
-        let local = local_panel_rect(panel, scale);
-        thread::spawn(move || {
-            for _ in 0..80 {
-                thread::sleep(Duration::from_millis(50));
-                if let Some(devtools) = find_devtools_window() {
-                    let parent = hwnd_from_isize(parent_hwnd);
-                    embed_window(devtools, parent, &local);
-                    EMBEDDED_HWND.store(devtools.0 as isize, Ordering::SeqCst);
-                    return;
-                }
+    pub fn open_in_panel(panel: &WebView, page_url: &str) {
+        for _ in 0..30 {
+            if let Some(url) = inspector_url_for_page(page_url) {
+                let _ = panel.set_visible(true);
+                let _ = panel.load_url(&url);
+                return;
             }
-        });
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = panel.set_visible(true);
     }
 
-    pub fn reposition_embedded(panel: Rect, scale: f64) {
-        let hwnd = EMBEDDED_HWND.load(Ordering::SeqCst);
-        if hwnd == 0 {
-            return;
-        }
-        let devtools = HWND(hwnd as _);
-        if !unsafe { IsWindowVisible(devtools).as_bool() } {
-            return;
-        }
-        embed_window(devtools, panel_host(), &local_panel_rect(panel, scale));
+    pub fn close_panel(panel: &WebView) {
+        let _ = panel.set_visible(false);
+        let _ = panel.load_url("about:blank");
     }
 
-    pub fn close_floating_window() {
-        let hwnd = EMBEDDED_HWND.load(Ordering::SeqCst);
-        if hwnd != 0 {
-            unsafe {
-                let _ = PostMessageW(HWND(hwnd as _), WM_CLOSE, WPARAM(0), LPARAM(0));
-            }
-            EMBEDDED_HWND.store(0, Ordering::SeqCst);
-            return;
-        }
-        if let Some(devtools) = find_devtools_window() {
-            unsafe {
-                let _ = PostMessageW(devtools, WM_CLOSE, WPARAM(0), LPARAM(0));
-            }
-        }
+    fn inspector_url_for_page(page_url: &str) -> Option<String> {
+        let targets = fetch_targets()?;
+        pick_target(&targets, page_url).and_then(|target| {
+            let path = target.get("devtoolsFrontendUrl")?.as_str()?;
+            Some(format!("{CDP_BASE}{path}"))
+        })
     }
 
-    fn hwnd_from_isize(hwnd: isize) -> HWND {
-        if hwnd != 0 {
-            HWND(hwnd as _)
-        } else {
-            HWND::default()
-        }
+    fn fetch_targets() -> Option<Vec<Value>> {
+        ureq::get(&format!("{CDP_BASE}/json"))
+            .call()
+            .ok()?
+            .into_json()
+            .ok()
     }
 
-    fn panel_host() -> HWND {
-        hwnd_from_isize(PANEL_HOST_HWND.load(Ordering::SeqCst))
-    }
+    fn pick_target<'a>(targets: &'a [Value], page_url: &str) -> Option<&'a Value> {
+        let pages: Vec<&Value> = targets
+            .iter()
+            .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+            .collect();
 
-    fn local_panel_rect(panel: Rect, scale: f64) -> RECT {
-        let size: PhysicalSize<f64> = panel.size.to_physical(scale);
-        RECT {
-            left: 0,
-            top: 0,
-            right: size.width.round() as i32,
-            bottom: size.height.round() as i32,
-        }
-    }
-
-    fn rect_to_physical(panel: Rect, scale: f64) -> RECT {
-        let pos: PhysicalPosition<f64> = panel.position.to_physical(scale);
-        let size: PhysicalSize<f64> = panel.size.to_physical(scale);
-        RECT {
-            left: pos.x.round() as i32,
-            top: pos.y.round() as i32,
-            right: (pos.x + size.width).round() as i32,
-            bottom: (pos.y + size.height).round() as i32,
-        }
-    }
-
-    fn find_child_near(main_hwnd: isize, target: &RECT) -> Option<HWND> {
-        let mut ctx = FindChildCtx {
-            target: *target,
-            best: HWND::default(),
-            best_dist: i64::MAX,
-        };
-        unsafe {
-            let _ = EnumChildWindows(
-                HWND(main_hwnd as _),
-                Some(enum_child),
-                LPARAM(&mut ctx as *mut _ as isize),
-            );
-        }
-        if ctx.best.0.is_null() {
-            None
-        } else {
-            Some(ctx.best)
-        }
-    }
-
-    struct FindChildCtx {
-        target: RECT,
-        best: HWND,
-        best_dist: i64,
-    }
-
-    unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let ctx = &mut *(lparam.0 as *mut FindChildCtx);
-        let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_err() {
-            return true.into();
-        }
-        let dist = (rect.left - ctx.target.left).abs() as i64
-            + (rect.top - ctx.target.top).abs() as i64
-            + (rect.right - ctx.target.right).abs() as i64
-            + (rect.bottom - ctx.target.bottom).abs() as i64;
-        if dist < ctx.best_dist {
-            ctx.best = hwnd;
-            ctx.best_dist = dist;
-        }
-        true.into()
-    }
-
-    fn embed_window(devtools: HWND, parent: HWND, local: &RECT) {
-        if parent.0.is_null() {
-            return;
-        }
-        unsafe {
-            let _ = SetParent(devtools, parent);
-            let style =
-                windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(devtools, GWL_STYLE)
-                    as u32;
-            let child_style = (style & !WS_POPUP.0) | WS_CHILD.0;
-            windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
-                devtools,
-                GWL_STYLE,
-                child_style as isize,
-            );
-            let w = local.right - local.left;
-            let h = local.bottom - local.top;
-            let _ = MoveWindow(devtools, local.left, local.top, w, h, true);
-            let _ = ShowWindow(devtools, SW_SHOW);
-        }
-    }
-
-    fn find_devtools_window() -> Option<HWND> {
-        let pid = unsafe { GetCurrentProcessId() };
-        unsafe {
-            let mut found = HWND::default();
-            let mut ctx = FindDevtoolsCtx {
-                pid,
-                found: &mut found,
-            };
-            let _ = EnumWindows(Some(enum_devtools), LPARAM(&mut ctx as *mut _ as isize));
-            if found.0.is_null() {
-                None
-            } else {
-                Some(found)
-            }
-        }
-    }
-
-    struct FindDevtoolsCtx<'a> {
-        pid: u32,
-        found: &'a mut HWND,
-    }
-
-    unsafe extern "system" fn enum_devtools(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let ctx = &mut *(lparam.0 as *mut FindDevtoolsCtx<'_>);
-        if !IsWindowVisible(hwnd).as_bool() {
-            return true.into();
-        }
-
-        let mut pid = 0u32;
-        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid != ctx.pid {
-            return true.into();
-        }
-
-        let mut class_buf = [0u16; 256];
-        let class_len = GetClassNameW(hwnd, &mut class_buf);
-        if class_len > 0 {
-            let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
-            if class_name.contains("Chrome_WidgetWin") {
-                *ctx.found = hwnd;
-                return false.into();
-            }
-        }
-
-        let len = GetWindowTextLengthW(hwnd);
-        if len > 0 {
-            let mut buf = vec![0u16; (len + 1) as usize];
-            let read = GetWindowTextW(hwnd, &mut buf);
-            if read > 0 {
-                let title = String::from_utf16_lossy(&buf[..read as usize]);
-                if title.contains("DevTools") {
-                    *ctx.found = hwnd;
-                    return false.into();
-                }
-            }
-        }
-
-        true.into()
+        pages
+            .iter()
+            .copied()
+            .find(|t| t.get("url").and_then(|v| v.as_str()) == Some(page_url))
+            .or_else(|| {
+                pages
+                    .iter()
+                    .copied()
+                    .find(|t| t.get("url").and_then(|v| v.as_str()).is_some_and(|u| !u.is_empty()))
+            })
+            .or_else(|| pages.last().copied())
     }
 }
