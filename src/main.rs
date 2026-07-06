@@ -1708,10 +1708,6 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         builder
             .with_url(&windows_toolbar_data_url(&initial))
             .with_custom_protocol("plum".to_string(), plum_protocol)
-            .with_additional_browser_args(
-                "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
-                 --remote-debugging-port=9222",
-            )
     };
 
     #[cfg(not(target_os = "windows"))]
@@ -1846,7 +1842,9 @@ struct WindowsRunState {
     modifiers: ModifiersState,
     z_order_nudges: u32,
     proxy: EventLoopProxy<UserEvent>,
-    bootstrapped: bool,
+    /// 0 = pending, 1 = window shown, 2 = bootstrap complete
+    bootstrap_phase: u8,
+    startup_focus_frames: u32,
 }
 
 #[cfg(target_os = "windows")]
@@ -1968,17 +1966,22 @@ fn cancel_devtools_panel_request() {
 
 #[cfg(target_os = "windows")]
 fn focus_main_window(window: &Window) {
-    window.set_focus();
     use tao::platform::windows::WindowExtWindows;
-    use windows::Win32::UI::WindowsAndMessaging::{BringWindowToTop, SetForegroundWindow};
-    let hwnd = window.hwnd();
-    if hwnd != 0 {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
+
+    let hwnd_raw = window.hwnd();
+    if hwnd_raw != 0 {
         unsafe {
-            let hwnd = windows::Win32::Foundation::HWND(hwnd as _);
+            let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as _);
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = ShowWindow(hwnd, SW_RESTORE);
             let _ = SetForegroundWindow(hwnd);
             let _ = BringWindowToTop(hwnd);
         }
     }
+    window.set_focus();
 }
 
 #[cfg(target_os = "windows")]
@@ -2564,7 +2567,8 @@ fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
 
     #[cfg(target_os = "windows")]
     {
-        builder = builder.with_decorations(false).with_visible(false);
+        // Visible from the start — if content webview creation stalls, the shell still appears.
+        builder = builder.with_decorations(false);
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -2580,54 +2584,73 @@ fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
 
 #[cfg(target_os = "windows")]
 fn bootstrap_win_app(app: &mut WindowsRunState) {
-    if app.bootstrapped {
+    match app.bootstrap_phase {
+        2 => return,
+        0 => {
+            win_startup("bootstrap: show window");
+            app.window.set_visible(true);
+            focus_main_window(&app.window);
+            app.startup_focus_frames = 120;
+            app.bootstrap_phase = 1;
+            log_windows_debug("bootstrap: window shown (phase 0)");
+        }
+        1 => {
+            win_startup("bootstrap: content webview");
+            let webview = build_content_webview(
+                &app.window,
+                app.proxy.clone(),
+                1,
+                NEWTAB_URL,
+                app.ww,
+                app.wh,
+                true,
+                app.devtools_open,
+            );
+            app.tabs.push(Tab {
+                id: 1,
+                url: NEWTAB_URL.to_string(),
+                title: "Новая вкладка".to_string(),
+                webview,
+            });
+            app.current = 0;
+            app.next_id = 2;
+
+            focus_main_window(&app.window);
+            raise_toolbar(
+                &app.toolbar,
+                &app.window,
+                Some(&app.tabs),
+                app.devtools_panel.as_ref(),
+            );
+            resize_all(
+                &app.window,
+                &app.toolbar,
+                &app.tabs,
+                app.ww,
+                app.wh,
+                app.devtools_open,
+                app.devtools_panel.as_ref(),
+            );
+            sync_toolbar(&app.toolbar, &app.tabs, app.current);
+            log_windows_layout(&app.toolbar, &app.tabs, "startup");
+            WIN_IPC_READY.store(true, Ordering::SeqCst);
+            flush_toolbar(&app.toolbar);
+            app.bootstrap_phase = 2;
+            log_windows_debug("bootstrap complete");
+        }
+        _ => {}
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn tick_startup_focus(app: &mut WindowsRunState) {
+    if app.startup_focus_frames == 0 {
         return;
     }
-    app.bootstrapped = true;
-
-    win_startup("bootstrap: content webview");
-    let webview = build_content_webview(
-        &app.window,
-        app.proxy.clone(),
-        1,
-        NEWTAB_URL,
-        app.ww,
-        app.wh,
-        true,
-        app.devtools_open,
-    );
-    app.tabs.push(Tab {
-        id: 1,
-        url: NEWTAB_URL.to_string(),
-        title: "Новая вкладка".to_string(),
-        webview,
-    });
-    app.current = 0;
-    app.next_id = 2;
-
-    app.window.set_visible(true);
-    focus_main_window(&app.window);
-    log_windows_debug("window shown");
-    raise_toolbar(
-        &app.toolbar,
-        &app.window,
-        Some(&app.tabs),
-        app.devtools_panel.as_ref(),
-    );
-    resize_all(
-        &app.window,
-        &app.toolbar,
-        &app.tabs,
-        app.ww,
-        app.wh,
-        app.devtools_open,
-        app.devtools_panel.as_ref(),
-    );
-    sync_toolbar(&app.toolbar, &app.tabs, app.current);
-    log_windows_layout(&app.toolbar, &app.tabs, "startup");
-    WIN_IPC_READY.store(true, Ordering::SeqCst);
-    flush_toolbar(&app.toolbar);
-    log_windows_debug("bootstrap complete");
+    app.startup_focus_frames -= 1;
+    if app.startup_focus_frames % 15 == 0 {
+        focus_main_window(&app.window);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2648,6 +2671,7 @@ fn run_windows_app(
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
         unsafe {
             bootstrap_win_app(win_app_mut(app_ptr));
+            tick_startup_focus(win_app_mut(app_ptr));
             drain_pending_ipc(app_ptr, control_flow);
             tick_devtools_connect(win_app_mut(app_ptr));
         }
@@ -2678,9 +2702,21 @@ fn run_windows_app(
 }
 
 
+#[cfg(target_os = "windows")]
+fn ensure_webview2_debug_port() {
+    const VAR: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
+    if std::env::var(VAR).is_err() {
+        // Needed for docked DevTools (CDP). run-as-app.cmd sets this too.
+        std::env::set_var(VAR, "--remote-debugging-port=9222");
+    }
+}
+
 fn main() {
     #[cfg(target_os = "windows")]
     init_windows_debug_log();
+
+    #[cfg(target_os = "windows")]
+    ensure_webview2_debug_port();
 
     #[cfg(target_os = "windows")]
     install_windows_panic_hook();
@@ -2733,7 +2769,8 @@ fn main() {
                 modifiers,
                 z_order_nudges: 0,
                 proxy,
-                bootstrapped: false,
+                bootstrap_phase: 0,
+                startup_focus_frames: 0,
             },
         );
         return;
