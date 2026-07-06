@@ -464,7 +464,7 @@ fn enforce_content_below_toolbar(
     devtools_open: bool,
 ) {
     use windows::Win32::Foundation::{HWND, POINT};
-    use windows::Win32::UI::WindowsAndMessaging::MapWindowPoints;
+    use windows::Win32::Graphics::Gdi::MapWindowPoints;
 
     let parent = HWND(window.hwnd() as _);
     let scale = window.scale_factor();
@@ -629,7 +629,7 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
             .status(200)
             .header(CONTENT_TYPE, "text/html; charset=utf-8")
             .body(Cow::Borrowed(
-                br#"<html><head><script>try{history.length>1&&history.back();}catch(e){}</script></head><body></body></html>"#,
+                &br#"<html><head><script>try{history.length>1&&history.back();}catch(e){}</script></head><body></body></html>"#,
             ))
             .unwrap();
     }
