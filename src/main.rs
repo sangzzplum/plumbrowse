@@ -6,6 +6,8 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
+use std::cell::UnsafeCell;
+#[cfg(target_os = "windows")]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex, OnceLock,
@@ -1767,7 +1769,7 @@ struct WindowsRunState {
 }
 
 #[cfg(target_os = "windows")]
-struct WinAppPtr(*mut WindowsRunState);
+struct WinAppPtr(*mut UnsafeCell<WindowsRunState>);
 
 #[cfg(target_os = "windows")]
 unsafe impl Send for WinAppPtr {}
@@ -1793,10 +1795,14 @@ fn win_ipc_fallback() -> &'static Mutex<Vec<String>> {
 }
 
 #[cfg(target_os = "windows")]
-fn register_win_app(app: &mut WindowsRunState) {
-    let ptr = (app as *mut WindowsRunState).cast();
-    let _ = WIN_APP_PTR.set(WinAppPtr(ptr));
-    log_windows_debug(&format!("win ipc host installed ptr={ptr:p}"));
+unsafe fn win_app_mut<'a>(ptr: WinAppPtr) -> &'a mut WindowsRunState {
+    &mut *(*ptr.0).get()
+}
+
+#[cfg(target_os = "windows")]
+fn register_win_app(ptr: WinAppPtr) {
+    let _ = WIN_APP_PTR.set(ptr);
+    log_windows_debug(&format!("win ipc host installed ptr={:p}", ptr.0));
     let pending = win_ipc_fallback()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1830,7 +1836,7 @@ fn dispatch_win_ipc(msg: &str) {
     log_windows_debug(&format!("handled ipc: {msg}"));
     let mut flow = ControlFlow::Wait;
     unsafe {
-        let app = &mut *ptr.cast::<WindowsRunState>();
+        let app = win_app_mut(*ptr);
         let mut ctx = IpcContext {
             control_flow: &mut flow,
             window: &app.window,
@@ -2363,11 +2369,12 @@ fn run_windows_app(
     state: WindowsRunState,
 ) {
     log_windows_debug("run_windows_app start");
-    let mut win_app = Box::new(state);
-    register_win_app(win_app.as_mut());
+    let raw = Box::into_raw(Box::new(UnsafeCell::new(state)));
+    let app_ptr = WinAppPtr(raw);
+    register_win_app(app_ptr);
 
-    {
-        let app = win_app.as_mut();
+    unsafe {
+        let app = win_app_mut(app_ptr);
         app.window.set_visible(true);
         raise_toolbar(
             &app.toolbar,
@@ -2393,23 +2400,25 @@ fn run_windows_app(
             *control_flow = ControlFlow::Exit;
         }
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
-        let app = win_app.as_mut();
-        dispatch_app_event(
-            event,
-            control_flow,
-            &app.window,
-            &app.toolbar,
-            Some(&app.devtools_panel),
-            &mut app.tabs,
-            &mut app.current,
-            &mut app.next_id,
-            &app.proxy,
-            &mut app.ww,
-            &mut app.wh,
-            &mut app.devtools_open,
-            &mut app.modifiers,
-            Some(&mut app.z_order_nudges),
-        );
+        unsafe {
+            let app = win_app_mut(app_ptr);
+            dispatch_app_event(
+                event,
+                control_flow,
+                &app.window,
+                &app.toolbar,
+                Some(&app.devtools_panel),
+                &mut app.tabs,
+                &mut app.current,
+                &mut app.next_id,
+                &app.proxy,
+                &mut app.ww,
+                &mut app.wh,
+                &mut app.devtools_open,
+                &mut app.modifiers,
+                Some(&mut app.z_order_nudges),
+            );
+        }
     });
 }
 
