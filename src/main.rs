@@ -685,12 +685,25 @@ fn tab_label(tab: &Tab) -> String {
     if !tab.title.is_empty() {
         return tab.title.clone();
     }
-    if tab.url.starts_with("plum://") {
+    if tab.url.starts_with("plum://") || tab.url.starts_with("data:text/html") {
         return "Новая вкладка".to_string();
     }
     tab.url
         .replace("https://", "")
         .replace("http://", "")
+}
+
+/// Keep logical URLs in tab state and the omnibox (never show data: document URLs).
+fn logical_tab_url(url: &str) -> String {
+    if url == NEWTAB_URL
+        || url.starts_with("data:text/html")
+        || url == "about:blank"
+        || url.is_empty()
+    {
+        NEWTAB_URL.to_string()
+    } else {
+        url.to_string()
+    }
 }
 
 fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
@@ -703,7 +716,9 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
 
     #[cfg(target_os = "windows")]
     {
-        let snap = {
+        let cur_url = logical_tab_url(&cur_url);
+        let urls: Vec<String> = urls.iter().map(|u| logical_tab_url(u)).collect();
+        {
             let mut snap = toolbar_snapshot()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
@@ -711,12 +726,8 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
             snap.urls = urls;
             snap.current = current;
             snap.cur_url = cur_url;
-            snap.clone()
-        };
-        match toolbar.load_url(&windows_toolbar_data_url(&snap)) {
-            Ok(()) => log_windows_debug("sync_toolbar reload ok"),
-            Err(err) => log_windows_debug(&format!("sync_toolbar reload failed: {err}")),
         }
+        TOOLBAR_DIRTY.store(true, Ordering::SeqCst);
         return;
     }
 
@@ -1460,7 +1471,7 @@ fn build_content_webview(
     #[cfg(target_os = "windows")]
     let webview = if url == NEWTAB_URL {
         builder
-            .with_html(NEWTAB_HTML)
+            .with_url(NEWTAB_URL)
             .build_as_child(window)
             .expect("failed to build content webview")
     } else {
@@ -1731,7 +1742,7 @@ fn open_new_tab(
     );
     tabs.push(Tab {
         id: tab_id,
-        url: url.to_string(),
+        url: logical_tab_url(url),
         title,
         webview,
     });
@@ -1795,10 +1806,10 @@ unsafe impl Sync for WinAppPtr {}
 static WIN_APP_PTR: OnceLock<WinAppPtr> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
-static WIN_IPC_FALLBACK: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static TOOLBAR_DIRTY: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
-static WIN_IPC_BUSY: AtomicBool = AtomicBool::new(false);
+static WIN_IPC_FALLBACK: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
 static WIN_EXIT: AtomicBool = AtomicBool::new(false);
@@ -1809,6 +1820,66 @@ static WIN_IPC_READY: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 fn win_ipc_fallback() -> &'static Mutex<Vec<String>> {
     WIN_IPC_FALLBACK.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(target_os = "windows")]
+fn flush_toolbar(toolbar: &WebView) {
+    if !TOOLBAR_DIRTY.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let snap = toolbar_snapshot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    match toolbar.load_url(&windows_toolbar_data_url(&snap)) {
+        Ok(()) => log_windows_debug("sync_toolbar reload ok"),
+        Err(err) => log_windows_debug(&format!("sync_toolbar reload failed: {err}")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn drain_pending_ipc(app_ptr: WinAppPtr, control_flow: &mut ControlFlow) {
+    if !WIN_IPC_READY.load(Ordering::SeqCst) {
+        return;
+    }
+    loop {
+        let batch = win_ipc_fallback()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        for msg in batch {
+            if msg == "ready" {
+                continue;
+            }
+            log_windows_debug(&format!("handled ipc: {msg}"));
+            let app = win_app_mut(app_ptr);
+            let mut flow = ControlFlow::Wait;
+            let mut ctx = IpcContext {
+                control_flow: &mut flow,
+                window: &app.window,
+                toolbar: &app.toolbar,
+                tabs: &mut app.tabs,
+                current: &mut app.current,
+                next_id: &mut app.next_id,
+                proxy: &app.proxy,
+                ww: &mut app.ww,
+                wh: &mut app.wh,
+                devtools_open: &mut app.devtools_open,
+                devtools_panel: app.devtools_panel.as_ref(),
+            };
+            process_ipc(&msg, &mut ctx);
+            if matches!(flow, ControlFlow::Exit) {
+                WIN_EXIT.store(true, Ordering::SeqCst);
+                *control_flow = ControlFlow::Exit;
+            }
+        }
+    }
+    let app = win_app_mut(app_ptr);
+    flush_toolbar(&app.toolbar);
 }
 
 #[cfg(target_os = "windows")]
@@ -1823,85 +1894,16 @@ fn register_win_app(ptr: WinAppPtr) {
 }
 
 #[cfg(target_os = "windows")]
-fn drain_win_ipc_fallback() {
-    let pending = win_ipc_fallback()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .drain(..)
-        .collect::<Vec<_>>();
-    for msg in pending {
-        dispatch_win_ipc(&msg);
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn dispatch_win_ipc(msg: &str) {
     if msg == "ready" {
         return;
     }
-
-    let Some(app_ptr) = WIN_APP_PTR.get() else {
-        win_ipc_fallback()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(msg.to_string());
-        log_windows_debug(&format!("ipc queued (host pending): {msg}"));
-        return;
-    };
-
-    if !WIN_IPC_READY.load(Ordering::SeqCst) {
-        win_ipc_fallback()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(msg.to_string());
-        log_windows_debug(&format!("ipc queued (not ready): {msg}"));
-        return;
-    }
-
-    if WIN_IPC_BUSY.swap(true, Ordering::SeqCst) {
-        win_ipc_fallback()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(msg.to_string());
-        log_windows_debug(&format!("ipc queued (busy): {msg}"));
-        return;
-    }
-
-    log_windows_debug(&format!("handled ipc: {msg}"));
-    let mut flow = ControlFlow::Wait;
-    unsafe {
-        let app = win_app_mut(*app_ptr);
-        let mut ctx = IpcContext {
-            control_flow: &mut flow,
-            window: &app.window,
-            toolbar: &app.toolbar,
-            tabs: &mut app.tabs,
-            current: &mut app.current,
-            next_id: &mut app.next_id,
-            proxy: &app.proxy,
-            ww: &mut app.ww,
-            wh: &mut app.wh,
-            devtools_open: &mut app.devtools_open,
-            devtools_panel: app.devtools_panel.as_ref(),
-        };
-        process_ipc(msg, &mut ctx);
-    }
-    WIN_IPC_BUSY.store(false, Ordering::SeqCst);
-
-    let pending = win_ipc_fallback()
+    win_ipc_fallback()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .drain(..)
-        .collect::<Vec<_>>();
-    for queued in pending {
-        dispatch_win_ipc(&queued);
-    }
-
-    if matches!(flow, ControlFlow::Exit) {
-        WIN_EXIT.store(true, Ordering::SeqCst);
-        if let Some(proxy) = EVENT_PROXY.get() {
-            let _ = proxy.send_event(UserEvent::WakeIpc);
-        }
+        .push(msg.to_string());
+    if let Some(proxy) = EVENT_PROXY.get() {
+        let _ = proxy.send_event(UserEvent::WakeIpc);
     }
 }
 
@@ -1911,20 +1913,8 @@ fn enqueue_ipc(msg: String) {
 }
 
 #[cfg(target_os = "windows")]
-fn newtab_data_url() -> String {
-    format!(
-        "data:text/html;charset=utf-8,{}",
-        percent_encode_ipc_path(NEWTAB_HTML)
-    )
-}
-
-#[cfg(target_os = "windows")]
 fn content_load_url(webview: &WebView, url: &str) {
-    let load_url = if url == NEWTAB_URL {
-        newtab_data_url()
-    } else {
-        url.to_string()
-    };
+    let load_url = logical_tab_url(url);
     let _ = webview.load_url(&load_url);
 }
 
@@ -2262,6 +2252,8 @@ fn dispatch_app_event(
                 return;
             }
             if let Some(idx) = find_tab_idx(tabs, tab_id) {
+                #[cfg(target_os = "windows")]
+                let url = logical_tab_url(&url);
                 tabs[idx].url = url;
                 if idx == *current {
                     sync_toolbar(toolbar, tabs, *current);
@@ -2440,7 +2432,7 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
     sync_toolbar(&app.toolbar, &app.tabs, app.current);
     log_windows_layout(&app.toolbar, &app.tabs, "startup");
     WIN_IPC_READY.store(true, Ordering::SeqCst);
-    drain_win_ipc_fallback();
+    flush_toolbar(&app.toolbar);
     log_windows_debug("bootstrap complete");
 }
 
@@ -2461,8 +2453,14 @@ fn run_windows_app(
         }
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
         unsafe {
+            bootstrap_win_app(win_app_mut(app_ptr));
+            drain_pending_ipc(app_ptr, control_flow);
+        }
+        if *control_flow == ControlFlow::Exit {
+            return;
+        }
+        unsafe {
             let app = win_app_mut(app_ptr);
-            bootstrap_win_app(app);
             dispatch_app_event(
                 event,
                 control_flow,
