@@ -705,8 +705,10 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
         return;
     }
 
+    #[cfg(not(target_os = "windows"))]
     let cur_url = tabs.get(current).map(|t| t.url.as_str()).unwrap_or("");
 
+    #[cfg(not(target_os = "windows"))]
     let script = format!(
         r#"(function(){{
   var titles = {titles};
@@ -734,11 +736,6 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
         current = current,
         cur_url = json!(cur_url)
     );
-    #[cfg(target_os = "windows")]
-    match toolbar.evaluate_script(&script) {
-        Ok(()) => log_windows_debug("sync_toolbar ok"),
-        Err(err) => log_windows_debug(&format!("sync_toolbar failed: {err}")),
-    }
     #[cfg(not(target_os = "windows"))]
     let _ = toolbar.evaluate_script(&script);
 }
@@ -1597,8 +1594,10 @@ fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
 }
 
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
+    #[cfg(not(target_os = "windows"))]
     let proxy_page = proxy.clone();
     let proxy_ipc = proxy.clone();
+    #[cfg(not(target_os = "windows"))]
     let proxy_nav = proxy.clone();
     let builder = WebViewBuilder::new()
         .with_bounds(bounds_toolbar(ww))
@@ -1768,7 +1767,16 @@ struct WindowsRunState {
 }
 
 #[cfg(target_os = "windows")]
-static WIN_APP_PTR: OnceLock<*mut WindowsRunState> = OnceLock::new();
+struct WinAppPtr(*mut WindowsRunState);
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for WinAppPtr {}
+
+#[cfg(target_os = "windows")]
+unsafe impl Sync for WinAppPtr {}
+
+#[cfg(target_os = "windows")]
+static WIN_APP_PTR: OnceLock<WinAppPtr> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
 static WIN_IPC_FALLBACK: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
@@ -1787,7 +1795,7 @@ fn win_ipc_fallback() -> &'static Mutex<Vec<String>> {
 #[cfg(target_os = "windows")]
 fn register_win_app(app: &mut WindowsRunState) {
     let ptr = (app as *mut WindowsRunState).cast();
-    let _ = WIN_APP_PTR.set(ptr);
+    let _ = WIN_APP_PTR.set(WinAppPtr(ptr));
     log_windows_debug(&format!("win ipc host installed ptr={ptr:p}"));
     let pending = win_ipc_fallback()
         .lock()
@@ -1801,7 +1809,7 @@ fn register_win_app(app: &mut WindowsRunState) {
 
 #[cfg(target_os = "windows")]
 fn dispatch_win_ipc(msg: &str) {
-    let Some(ptr) = WIN_APP_PTR.get() else {
+    let Some(WinAppPtr(ptr)) = WIN_APP_PTR.get() else {
         win_ipc_fallback()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2482,43 +2490,45 @@ fn main() {
         return;
     }
 
-    raise_toolbar(
-        &toolbar,
-        &window,
-        Some(&tabs),
-    );
-
-    resize_all(
-        &window,
-        &toolbar,
-        &tabs,
-        ww,
-        wh,
-        devtools_open,
-    );
-
-    sync_toolbar(&toolbar, &tabs, current);
-
     #[cfg(not(target_os = "windows"))]
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-        dispatch_app_event(
-            event,
-            control_flow,
+    {
+        raise_toolbar(
+            &toolbar,
+            &window,
+            Some(&tabs),
+        );
+
+        resize_all(
             &window,
             &toolbar,
-            None,
-            &mut tabs,
-            &mut current,
-            &mut next_id,
-            &proxy,
-            &mut ww,
-            &mut wh,
-            &mut devtools_open,
-            &mut modifiers,
-            None,
+            &tabs,
+            ww,
+            wh,
+            devtools_open,
         );
-    });
+
+        sync_toolbar(&toolbar, &tabs, current);
+
+        event_loop.run(move |event, _, control_flow| {
+            *control_flow = ControlFlow::Wait;
+            dispatch_app_event(
+                event,
+                control_flow,
+                &window,
+                &toolbar,
+                None,
+                &mut tabs,
+                &mut current,
+                &mut next_id,
+                &proxy,
+                &mut ww,
+                &mut wh,
+                &mut devtools_open,
+                &mut modifiers,
+                None,
+            );
+        });
+    }
 }
 
 
