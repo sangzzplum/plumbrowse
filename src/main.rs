@@ -184,8 +184,8 @@ fn sync_windows_z_order(
 fn enforce_content_clipping(webview: &WebView, window: &Window) {
     use tao::platform::windows::WindowExtWindows;
     use windows::Win32::Foundation::{HWND, POINT, RECT};
-    use windows::Win32::Graphics::Gdi::{CreateRectRgn, SetWindowRgn};
-    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, MapWindowPoints};
+    use windows::Win32::Graphics::Gdi::{CreateRectRgn, MapWindowPoints, SetWindowRgn};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
     let Some(host) = webview_host_hwnd(webview) else {
         return;
@@ -203,7 +203,7 @@ fn enforce_content_clipping(webview: &WebView, window: &Window) {
         x: host_rect.left,
         y: host_rect.top,
     };
-    if unsafe { MapWindowPoints(None, Some(parent), std::slice::from_mut(&mut top_left)) }.is_err() {
+    if unsafe { MapWindowPoints(None, Some(parent), std::slice::from_mut(&mut top_left)) } == 0 {
         return;
     }
 
@@ -222,7 +222,8 @@ fn enforce_content_clipping(webview: &WebView, window: &Window) {
     }
 
     unsafe {
-        if let Ok(rgn) = CreateRectRgn(0, clip_top, client_w, client_h) {
+        let rgn = CreateRectRgn(0, clip_top, client_w, client_h);
+        if !rgn.is_invalid() {
             let _ = SetWindowRgn(host, rgn, true);
         }
     }
