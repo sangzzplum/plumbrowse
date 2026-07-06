@@ -11,7 +11,7 @@ use std::cell::UnsafeCell;
 #[cfg(target_os = "windows")]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Mutex, OnceLock,
+    Mutex,
 };
 use tao::{
     dpi::PhysicalSize,
