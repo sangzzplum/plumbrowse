@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 use std::sync::{
-    mpsc::{self, Receiver, Sender},
+    atomic::{AtomicBool, Ordering},
     Mutex, OnceLock,
 };
 use tao::{
@@ -1754,22 +1754,118 @@ fn open_new_tab(
 }
 
 #[cfg(target_os = "windows")]
-static IPC_SENDER: OnceLock<Sender<String>> = OnceLock::new();
+static WIN_IPC_HOST: OnceLock<WinIpcHost> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static WIN_IPC_FALLBACK: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static WIN_EXIT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "windows")]
+struct WinIpcHost {
+    window: *const Window,
+    toolbar: *const WebView,
+    tabs: *mut Vec<Tab>,
+    current: *mut usize,
+    next_id: *mut u32,
+    proxy: *const EventLoopProxy<UserEvent>,
+    ww: *mut f64,
+    wh: *mut f64,
+    devtools_open: *mut bool,
+    devtools_panel: *const WebView,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for WinIpcHost {}
+
+#[cfg(target_os = "windows")]
+unsafe impl Sync for WinIpcHost {}
+
+#[cfg(target_os = "windows")]
+fn win_ipc_fallback() -> &'static Mutex<Vec<String>> {
+    WIN_IPC_FALLBACK.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(target_os = "windows")]
+fn install_win_ipc_host(
+    window: &Window,
+    toolbar: &WebView,
+    tabs: &mut Vec<Tab>,
+    current: &mut usize,
+    next_id: &mut u32,
+    proxy: &EventLoopProxy<UserEvent>,
+    ww: &mut f64,
+    wh: &mut f64,
+    devtools_open: &mut bool,
+    devtools_panel: &WebView,
+) {
+    let host = WinIpcHost {
+        window: (window as *const Window).cast(),
+        toolbar: (toolbar as *const WebView).cast(),
+        tabs: (tabs as *mut Vec<Tab>).cast(),
+        current: (current as *mut usize).cast(),
+        next_id: (next_id as *mut u32).cast(),
+        proxy: (proxy as *const EventLoopProxy<UserEvent>).cast(),
+        ww: (ww as *mut f64).cast(),
+        wh: (wh as *mut f64).cast(),
+        devtools_open: (devtools_open as *mut bool).cast(),
+        devtools_panel: (devtools_panel as *const WebView).cast(),
+    };
+    let _ = WIN_IPC_HOST.set(host);
+    let pending = win_ipc_fallback()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect::<Vec<_>>();
+    for msg in pending {
+        dispatch_win_ipc(&msg);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn dispatch_win_ipc(msg: &str) {
+    let Some(host) = WIN_IPC_HOST.get() else {
+        win_ipc_fallback().lock().unwrap_or_else(|e| e.into_inner()).push(msg.to_string());
+        log_windows_debug(&format!("ipc queued (host pending): {msg}"));
+        return;
+    };
+
+    log_windows_debug(&format!("handled ipc: {msg}"));
+    let mut flow = ControlFlow::Wait;
+    unsafe {
+        let mut ctx = IpcContext {
+            control_flow: &mut flow,
+            window: &*host.window,
+            toolbar: &*host.toolbar,
+            tabs: &mut *host.tabs,
+            current: &mut *host.current,
+            next_id: &mut *host.next_id,
+            proxy: &*host.proxy,
+            ww: &mut *host.ww,
+            wh: &mut *host.wh,
+            devtools_open: &mut *host.devtools_open,
+            devtools_panel: Some(&*host.devtools_panel),
+        };
+        process_ipc(msg, &mut ctx);
+    }
+    if matches!(flow, ControlFlow::Exit) {
+        WIN_EXIT.store(true, Ordering::SeqCst);
+        if let Some(proxy) = EVENT_PROXY.get() {
+            let _ = proxy.send_event(UserEvent::WakeIpc);
+        }
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(400));
+            if WIN_EXIT.load(Ordering::SeqCst) {
+                std::process::exit(0);
+            }
+        });
+    }
+}
 
 #[cfg(target_os = "windows")]
 fn enqueue_ipc(msg: String) {
-    let Some(tx) = IPC_SENDER.get() else {
-        log_windows_debug("ipc sender missing");
-        return;
-    };
-    match tx.send(msg) {
-        Ok(()) => {
-            if let Some(proxy) = EVENT_PROXY.get() {
-                let _ = proxy.send_event(UserEvent::WakeIpc);
-            }
-        }
-        Err(e) => log_windows_debug(&format!("ipc enqueue failed: {e}")),
-    }
+    dispatch_win_ipc(&msg);
 }
 
 #[cfg(target_os = "windows")]
@@ -1834,7 +1930,11 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
             );
             sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
         }
-        "win_close" => *ctx.control_flow = ControlFlow::Exit,
+        "win_close" => {
+            #[cfg(target_os = "windows")]
+            WIN_EXIT.store(true, Ordering::SeqCst);
+            *ctx.control_flow = ControlFlow::Exit;
+        }
         "ready" => {
             #[cfg(not(target_os = "windows"))]
             sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
@@ -1980,41 +2080,6 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
     }
 }
 
-#[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
-fn drain_and_process_ipc(
-    ipc_rx: &Receiver<String>,
-    control_flow: &mut ControlFlow,
-    window: &Window,
-    toolbar: &WebView,
-    tabs: &mut Vec<Tab>,
-    current: &mut usize,
-    next_id: &mut u32,
-    proxy: &EventLoopProxy<UserEvent>,
-    ww: &mut f64,
-    wh: &mut f64,
-    devtools_open: &mut bool,
-    devtools_panel: &WebView,
-) {
-    while let Ok(msg) = ipc_rx.try_recv() {
-        log_windows_debug(&format!("handled ipc: {msg}"));
-        let mut ipc_ctx = IpcContext {
-            control_flow,
-            window,
-            toolbar,
-            tabs,
-            current,
-            next_id,
-            proxy,
-            ww,
-            wh,
-            devtools_open,
-            devtools_panel: Some(devtools_panel),
-        };
-        process_ipc(&msg, &mut ipc_ctx);
-    }
-}
-
 fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
     let mut builder = WindowBuilder::new()
         .with_title(version_label())
@@ -2061,10 +2126,6 @@ fn main() {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    #[cfg(target_os = "windows")]
-    let (ipc_tx, ipc_rx) = mpsc::channel::<String>();
-    #[cfg(target_os = "windows")]
-    let _ = IPC_SENDER.set(ipc_tx);
     #[cfg(target_os = "windows")]
     let _ = EVENT_PROXY.set(proxy.clone());
 
@@ -2130,23 +2191,30 @@ fn main() {
     #[cfg(target_os = "windows")]
     log_windows_layout(&toolbar, &tabs, "startup");
 
+    #[cfg(target_os = "windows")]
+    let mut win_ipc_installed = false;
+
     event_loop.run(move |event, _, control_flow| {
         #[cfg(target_os = "windows")]
         {
-            drain_and_process_ipc(
-                &ipc_rx,
-                control_flow,
-                &window,
-                &toolbar,
-                &mut tabs,
-                &mut current,
-                &mut next_id,
-                &proxy,
-                &mut ww,
-                &mut wh,
-                &mut devtools_open,
-                &devtools_panel,
-            );
+            if !win_ipc_installed {
+                install_win_ipc_host(
+                    &window,
+                    &toolbar,
+                    &mut tabs,
+                    &mut current,
+                    &mut next_id,
+                    &proxy,
+                    &mut ww,
+                    &mut wh,
+                    &mut devtools_open,
+                    &devtools_panel,
+                );
+                win_ipc_installed = true;
+            }
+            if WIN_EXIT.load(Ordering::SeqCst) {
+                *control_flow = ControlFlow::Exit;
+            }
             *control_flow =
                 ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
         }
@@ -2364,20 +2432,6 @@ fn main() {
 
             #[cfg(target_os = "windows")]
             Event::MainEventsCleared => {
-                drain_and_process_ipc(
-                    &ipc_rx,
-                    control_flow,
-                    &window,
-                    &toolbar,
-                    &mut tabs,
-                    &mut current,
-                    &mut next_id,
-                    &proxy,
-                    &mut ww,
-                    &mut wh,
-                    &mut devtools_open,
-                    &devtools_panel,
-                );
                 if z_order_nudges < 60 {
                     raise_toolbar(
                         &toolbar,
