@@ -1,6 +1,9 @@
 @echo off
 cd /d "%~dp0.."
 
+echo Stopping PlumBrowser if running...
+taskkill /IM plumbrowser.exe /F >nul 2>&1
+
 if /I "%~1"=="release" (
   echo cargo build --release...
   cargo build --release

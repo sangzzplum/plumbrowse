@@ -176,10 +176,11 @@ fn version_label() -> String {
 }
 
 fn toolbar_navigation_allowed(url: &str) -> bool {
-    !(url.starts_with("http://")
-        || url.starts_with("https://")
-        || url.starts_with("file://"))
+    !url.starts_with("http://") && !url.starts_with("https://") && !url.starts_with("file://")
 }
+
+#[cfg(target_os = "windows")]
+const TOOLBAR_PROTOCOL_URL: &str = "plum://toolbar/";
 
 /// Toolbar — это UI, не сайт.
 const TOOLBAR_LOCK_SCRIPT: &str = r#"
@@ -338,6 +339,15 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
     let host = uri.host().unwrap_or_default();
     let path = uri.path();
 
+    if host == "toolbar" || path.starts_with("/toolbar") {
+        let html = toolbar_html();
+        return Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Cow::Owned(html.into_bytes()))
+            .unwrap();
+    }
+
     let (mime, body): (&str, Cow<'static, [u8]>) = match path {
         "/newtab" | "/newtab/" | "/" if host.is_empty() || host == "newtab" => (
             "text/html; charset=utf-8",
@@ -418,6 +428,9 @@ const TOOLBAR_SCRIPT: &str = r#"
             e.preventDefault();
           }
         }, { passive: false });
+        if (typeof ResizeObserver !== 'undefined') {
+          new ResizeObserver(() => layoutTabs()).observe(strip);
+        }
       }
 
       document.getElementById('back').addEventListener('click', () => post('nav_back'));
@@ -436,55 +449,45 @@ const TOOLBAR_SCRIPT: &str = r#"
       post('ready');
     });
 
-    const TAB_PREF = 168;
     const TAB_MIN = 48;
     const TAB_MAX = 220;
     const TAB_GAP = 8;
 
     function layoutTabs() {
       const strip = document.getElementById('tab-strip');
-      const bar = strip.parentElement;
-      const addBtn = document.getElementById('addtab');
-      const dragFill = bar.querySelector('.drag-fill');
-      const tabs = [...strip.querySelectorAll('.tab')];
-      const n = tabs.length;
-      if (n === 0) return;
+      if (!strip) return;
+      requestAnimationFrame(() => {
+        const tabs = [...strip.querySelectorAll('.tab')];
+        const n = tabs.length;
+        if (n === 0) return;
 
-      let reserved = addBtn.offsetWidth + TAB_GAP;
-      if (dragFill) reserved += dragFill.offsetWidth;
-      const avail = Math.max(0, bar.clientWidth - reserved);
+        const avail = strip.clientWidth;
+        const gap = TAB_GAP;
+        strip.classList.remove('scroll');
 
-      strip.classList.remove('shrink', 'scroll');
-      const prefTotal = n * TAB_PREF + Math.max(0, n - 1) * TAB_GAP;
-      const minTotal = n * TAB_MIN + Math.max(0, n - 1) * TAB_GAP;
+        const minTotal = n * TAB_MIN + Math.max(0, n - 1) * gap;
+        if (minTotal > avail) {
+          strip.classList.add('scroll');
+          tabs.forEach(t => {
+            t.style.flex = '0 0 ' + TAB_MIN + 'px';
+            t.style.width = TAB_MIN + 'px';
+            t.style.minWidth = TAB_MIN + 'px';
+            t.style.maxWidth = TAB_MIN + 'px';
+          });
+          const active = strip.querySelector('.tab.active');
+          if (active) active.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+          return;
+        }
 
-      if (prefTotal <= avail) {
-        tabs.forEach(t => {
-          t.style.flex = '1 1 ' + TAB_PREF + 'px';
-          t.style.minWidth = '72px';
-          t.style.maxWidth = TAB_MAX + 'px';
-          t.style.width = '';
-        });
-      } else if (minTotal <= avail) {
-        strip.classList.add('shrink');
-        const each = Math.max(TAB_MIN, Math.floor((avail - Math.max(0, n - 1) * TAB_GAP) / n));
+        let width = Math.floor((avail - Math.max(0, n - 1) * gap) / n);
+        width = Math.min(TAB_MAX, Math.max(TAB_MIN, width));
         tabs.forEach(t => {
           t.style.flex = '1 1 0';
+          t.style.width = width + 'px';
           t.style.minWidth = TAB_MIN + 'px';
-          t.style.maxWidth = 'none';
-          t.style.width = each + 'px';
+          t.style.maxWidth = TAB_MAX + 'px';
         });
-      } else {
-        strip.classList.add('scroll');
-        tabs.forEach(t => {
-          t.style.flex = '0 0 ' + TAB_MIN + 'px';
-          t.style.minWidth = TAB_MIN + 'px';
-          t.style.maxWidth = TAB_MIN + 'px';
-          t.style.width = TAB_MIN + 'px';
-        });
-        const active = strip.querySelector('.tab.active');
-        if (active) active.scrollIntoView({ inline: 'nearest', block: 'nearest' });
-      }
+      });
     }
 
     window.addEventListener('resize', () => layoutTabs());
@@ -522,6 +525,7 @@ const TOOLBAR_SCRIPT: &str = r#"
         const el = tab.querySelector('.tab-title');
         if (el) el.textContent = title;
       }
+      layoutTabs();
     };
 "#;
 
@@ -531,7 +535,7 @@ const TAB_BAR_CSS: &str = r#"
     .tabs-bar { display:flex; align-items:center; gap:8px; min-height:32px; width:100%; }
     .tab-strip {
       display:flex; gap:8px; align-items:center;
-      flex:1 1 auto; min-width:0;
+      flex:1 1 0%; min-width:0; width:0;
       overflow-x:auto; overflow-y:hidden;
       scrollbar-width:thin; scrollbar-color:#5f6368 transparent;
     }
@@ -560,15 +564,10 @@ const TAB_BAR_CSS: &str = r#"
     }
     .tab-close:hover { background:#2a2b2f; color:var(--fg); }
     .tab-strip.scroll .tab-title { display:none; }
-    .drag-fill {
-      flex:1 1 auto; min-width:24px; height:32px;
-      -webkit-app-region:drag;
-    }
 "#;
 
 fn toolbar_html() -> String {
     let toolbar_h = toolbar_height() as i32;
-    let version = version_label();
 
     if cfg!(target_os = "macos") {
         return format!(
@@ -586,8 +585,9 @@ fn toolbar_html() -> String {
     html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#202124; }}
     body {{ background:var(--bg); color:var(--fg); font:14px/1.2 system-ui,"Segoe UI",Arial; }}
     .chrome {{ height:var(--toolbarH); display:flex; flex-direction:column; }}
-    .tabs-wrap {{ padding:28px 12px 0; }}
+    .tabs-wrap {{ padding:28px 12px 0; -webkit-app-region:drag; }}
     {tab_bar_css}
+    .tabs-bar {{ -webkit-app-region:no-drag; }}
     .addtab, .tab, .navbtn, input, .go {{ -webkit-app-region:no-drag; }}
     .nav-row {{ display:flex; gap:8px; align-items:center; padding:8px 12px 10px; }}
     .navbtn {{
@@ -613,7 +613,6 @@ fn toolbar_html() -> String {
       <div class="tabs-bar">
         <div class="tab-strip" id="tab-strip"></div>
         <div class="addtab" id="addtab" title="Новая вкладка">+</div>
-        <div class="drag-fill"></div>
       </div>
     </div>
     <div class="nav-row">
@@ -679,7 +678,7 @@ fn toolbar_html() -> String {
 <body>
   <div class="chrome">
     <div class="titlebar">
-      <div class="drag" id="drag">{version}</div>
+      <div class="drag" id="drag">PlumBrowser</div>
       <div class="winbtns">
         <div class="wbtn" id="min" title="Свернуть">—</div>
         <div class="wbtn" id="max" title="Развернуть">□</div>
@@ -705,8 +704,7 @@ fn toolbar_html() -> String {
 </body>
 </html>"#,
         script = TOOLBAR_SCRIPT,
-        tab_bar_css = TAB_BAR_CSS,
-        version = version
+        tab_bar_css = TAB_BAR_CSS
     )
 }
 
@@ -728,7 +726,7 @@ fn build_content_webview(
         .with_focused(visible)
         .with_clipboard(true)
         .with_back_forward_navigation_gestures(true)
-        .with_devtools(true)
+        .with_devtools(!cfg!(target_os = "windows"))
         .with_hotkeys_zoom(true)
         .with_initialization_script(CONTENT_SHORTCUT_SCRIPT)
         .with_custom_protocol("plum".to_string(), plum_protocol)
@@ -775,14 +773,14 @@ fn build_content_webview(
     #[cfg(target_os = "windows")]
     let builder = builder
         .with_browser_accelerator_keys(false)
-        .with_additional_browser_args("--remote-debugging-port=9222");
+        .with_additional_browser_args("--remote-debugging-port=9222 --remote-allow-origins=*");
 
     builder
         .build_as_child(window)
         .expect("failed to build content webview")
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+#[allow(unused_variables)]
 fn show_tab(
     window: &Window,
     tabs: &[Tab],
@@ -813,7 +811,7 @@ fn show_tab(
     raise_toolbar(toolbar);
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+#[allow(unused_variables)]
 fn resize_all(
     window: &Window,
     toolbar: &WebView,
@@ -897,8 +895,7 @@ fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
 }
 
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
-    let builder = WebViewBuilder::new()
-        .with_html(toolbar_html())
+    let mut builder = WebViewBuilder::new()
         .with_bounds(bounds_toolbar(ww))
         .with_background_color(TOOLBAR_BG)
         .with_focused(false)
@@ -914,9 +911,18 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         });
 
     #[cfg(target_os = "windows")]
-    let builder = builder
-        .with_default_context_menus(false)
-        .with_browser_accelerator_keys(false);
+    {
+        builder = builder
+            .with_url(TOOLBAR_PROTOCOL_URL)
+            .with_custom_protocol("plum".to_string(), plum_protocol)
+            .with_default_context_menus(false)
+            .with_browser_accelerator_keys(false);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        builder = builder.with_html(toolbar_html());
+    }
 
     builder
         .build_as_child(window)
@@ -1036,6 +1042,12 @@ fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
 
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    std::env::set_var(
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "--remote-debugging-port=9222 --remote-allow-origins=*",
+    );
+
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
@@ -1373,7 +1385,7 @@ mod win_devtools {
     const CDP_BASE: &str = "http://127.0.0.1:9222";
 
     pub fn open_in_panel(panel: &WebView, page_url: &str) {
-        for _ in 0..30 {
+        for _ in 0..50 {
             if let Some(url) = inspector_url_for_page(page_url) {
                 let _ = panel.set_visible(true);
                 let _ = panel.load_url(&url);
@@ -1392,17 +1404,44 @@ mod win_devtools {
     fn inspector_url_for_page(page_url: &str) -> Option<String> {
         let targets = fetch_targets()?;
         pick_target(&targets, page_url).and_then(|target| {
-            let path = target.get("devtoolsFrontendUrl")?.as_str()?;
-            Some(format!("{CDP_BASE}{path}"))
+            if let Some(path) = target.get("devtoolsFrontendUrl").and_then(|v| v.as_str()) {
+                return Some(frontend_url(path));
+            }
+            let ws = target.get("webSocketDebuggerUrl")?.as_str()?;
+            Some(format!(
+                "{CDP_BASE}/devtools/inspector.html?ws={}",
+                ws.trim_start_matches("ws://")
+            ))
         })
     }
 
+    fn frontend_url(path: &str) -> String {
+        if path.starts_with("http://") || path.starts_with("https://") {
+            path.to_string()
+        } else {
+            format!("{CDP_BASE}{path}")
+        }
+    }
+
     fn fetch_targets() -> Option<Vec<Value>> {
-        ureq::get(&format!("{CDP_BASE}/json"))
-            .call()
-            .ok()?
-            .into_json()
-            .ok()
+        for endpoint in ["/json/list", "/json"] {
+            if let Ok(resp) = ureq::get(&format!("{CDP_BASE}{endpoint}")).call() {
+                if let Ok(targets) = resp.into_json::<Vec<Value>>() {
+                    if !targets.is_empty() {
+                        return Some(targets);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn normalize_url(url: &str) -> String {
+        url.trim_end_matches('/').to_string()
+    }
+
+    fn urls_match(a: &str, b: &str) -> bool {
+        normalize_url(a) == normalize_url(b)
     }
 
     fn pick_target<'a>(targets: &'a [Value], page_url: &str) -> Option<&'a Value> {
@@ -1414,7 +1453,11 @@ mod win_devtools {
         pages
             .iter()
             .copied()
-            .find(|t| t.get("url").and_then(|v| v.as_str()) == Some(page_url))
+            .find(|t| {
+                t.get("url")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|u| urls_match(u, page_url))
+            })
             .or_else(|| {
                 pages
                     .iter()
