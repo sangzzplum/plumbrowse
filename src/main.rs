@@ -745,9 +745,7 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
 
     if let Some(msg) = toolbar_ipc_from_url(&full) {
         #[cfg(target_os = "windows")]
-        if let Some(proxy) = EVENT_PROXY.get() {
-            let _ = proxy.send_event(UserEvent::Ipc(msg));
-        }
+        enqueue_ipc(msg);
         return Response::builder()
             .status(200)
             .header(CONTENT_TYPE, "text/html; charset=utf-8")
@@ -1611,6 +1609,9 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
             if let Some(msg) = toolbar_ipc_from_url(&url) {
                 #[cfg(target_os = "windows")]
                 log_windows_debug(&format!("toolbar nav ipc: {msg}"));
+                #[cfg(target_os = "windows")]
+                enqueue_ipc(msg);
+                #[cfg(not(target_os = "windows"))]
                 let _ = proxy_nav.send_event(UserEvent::Ipc(msg));
                 return false;
             }
@@ -1618,6 +1619,9 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         })
         .with_on_page_load_handler(move |event, _| {
             if matches!(event, PageLoadEvent::Finished) {
+                #[cfg(target_os = "windows")]
+                enqueue_ipc("ready".to_string());
+                #[cfg(not(target_os = "windows"))]
                 let _ = proxy_page.send_event(UserEvent::Ipc("ready".to_string()));
             }
         })
@@ -1741,6 +1745,236 @@ fn open_new_tab(
         #[cfg(target_os = "windows")]
         devtools_panel,
     );
+}
+
+#[cfg(target_os = "windows")]
+static IPC_INBOX: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+fn enqueue_ipc(msg: String) {
+    IPC_INBOX
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(msg);
+}
+
+#[cfg(target_os = "windows")]
+fn drain_ipc_inbox() -> Vec<String> {
+    IPC_INBOX
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn newtab_data_url() -> String {
+    format!(
+        "data:text/html;charset=utf-8,{}",
+        percent_encode_ipc_path(NEWTAB_HTML)
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn content_load_url(webview: &WebView, url: &str) {
+    let load_url = if url == NEWTAB_URL {
+        newtab_data_url()
+    } else {
+        url.to_string()
+    };
+    let _ = webview.load_url(&load_url);
+}
+
+struct IpcContext<'a> {
+    control_flow: &'a mut ControlFlow,
+    window: &'a Window,
+    toolbar: &'a WebView,
+    tabs: &'a mut Vec<Tab>,
+    current: &'a mut usize,
+    next_id: &'a mut u32,
+    proxy: &'a EventLoopProxy<UserEvent>,
+    ww: &'a mut f64,
+    wh: &'a mut f64,
+    devtools_open: &'a mut bool,
+    #[cfg(target_os = "windows")]
+    devtools_panel: Option<&'a WebView>,
+}
+
+fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
+    match msg {
+        "win_drag" => {
+            let _ = ctx.window.drag_window();
+        }
+        "win_min" => ctx.window.set_minimized(true),
+        "win_max_toggle" => {
+            let m = ctx.window.is_maximized();
+            ctx.window.set_maximized(!m);
+            (*ctx.ww, *ctx.wh) = logical_size(ctx.window);
+            resize_all(
+                ctx.window,
+                ctx.toolbar,
+                ctx.tabs,
+                *ctx.ww,
+                *ctx.wh,
+                *ctx.devtools_open,
+                #[cfg(target_os = "windows")]
+                ctx.devtools_panel,
+            );
+            raise_toolbar(
+                ctx.toolbar,
+                ctx.window,
+                Some(ctx.tabs),
+                #[cfg(target_os = "windows")]
+                ctx.devtools_panel,
+            );
+            sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
+        }
+        "win_close" => *ctx.control_flow = ControlFlow::Exit,
+        "ready" => {
+            #[cfg(not(target_os = "windows"))]
+            sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
+            raise_toolbar(
+                ctx.toolbar,
+                ctx.window,
+                Some(ctx.tabs),
+                #[cfg(target_os = "windows")]
+                ctx.devtools_panel,
+            );
+            #[cfg(target_os = "windows")]
+            log_windows_layout(ctx.toolbar, ctx.tabs, "toolbar_ready");
+        }
+        "focus_content" => focus_active_tab(ctx.tabs, *ctx.current),
+        "nav_back" => {
+            webview_go_back(&ctx.tabs[*ctx.current].webview);
+            focus_active_tab(ctx.tabs, *ctx.current);
+        }
+        "nav_forward" => {
+            webview_go_forward(&ctx.tabs[*ctx.current].webview);
+            focus_active_tab(ctx.tabs, *ctx.current);
+        }
+        "nav_reload" => {
+            let _ = ctx.tabs[*ctx.current].webview.reload();
+            focus_active_tab(ctx.tabs, *ctx.current);
+        }
+        "nav_devtools" => {
+            toggle_devtools(
+                ctx.window,
+                ctx.toolbar,
+                ctx.tabs,
+                *ctx.current,
+                ctx.devtools_open,
+                *ctx.ww,
+                *ctx.wh,
+                #[cfg(target_os = "windows")]
+                ctx.devtools_panel,
+            );
+        }
+        _ if msg.starts_with("load:") => {
+            if let Some(rest) = msg.strip_prefix("load:") {
+                if let Some(url) = resolve_omnibox_input(rest) {
+                    ctx.tabs[*ctx.current].url = url.clone();
+                    ctx.tabs[*ctx.current].title.clear();
+                    #[cfg(target_os = "windows")]
+                    content_load_url(&ctx.tabs[*ctx.current].webview, &url);
+                    #[cfg(not(target_os = "windows"))]
+                    let _ = ctx.tabs[*ctx.current].webview.load_url(&url);
+                    #[cfg(not(target_os = "windows"))]
+                    let _ = ctx.tabs[*ctx.current].webview.focus();
+                    sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
+                    raise_toolbar(
+                        ctx.toolbar,
+                        ctx.window,
+                        Some(ctx.tabs),
+                        #[cfg(target_os = "windows")]
+                        ctx.devtools_panel,
+                    );
+                }
+            }
+        }
+        _ if msg.starts_with("new_tab:") => {
+            open_new_tab(
+                ctx.window,
+                ctx.proxy,
+                ctx.tabs,
+                ctx.current,
+                ctx.next_id,
+                ctx.toolbar,
+                NEWTAB_URL,
+                *ctx.ww,
+                *ctx.wh,
+                *ctx.devtools_open,
+                #[cfg(target_os = "windows")]
+                ctx.devtools_panel,
+            );
+        }
+        _ if msg.starts_with("switch_tab:") => {
+            if let Some(rest) = msg.strip_prefix("switch_tab:") {
+                if let Ok(idx) = rest.trim().parse::<usize>() {
+                    if idx < ctx.tabs.len() {
+                        *ctx.current = idx;
+                        show_tab(
+                            ctx.window,
+                            ctx.tabs,
+                            *ctx.current,
+                            ctx.toolbar,
+                            *ctx.devtools_open,
+                            *ctx.ww,
+                            *ctx.wh,
+                            #[cfg(target_os = "windows")]
+                            ctx.devtools_panel,
+                        );
+                        sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
+                    }
+                }
+            }
+        }
+        _ if msg.starts_with("close_tab:") => {
+            if let Some(rest) = msg.strip_prefix("close_tab:") {
+                if let Ok(idx) = rest.trim().parse::<usize>() {
+                    if idx < ctx.tabs.len() {
+                        ctx.tabs.remove(idx);
+                        if ctx.tabs.is_empty() {
+                            open_new_tab(
+                                ctx.window,
+                                ctx.proxy,
+                                ctx.tabs,
+                                ctx.current,
+                                ctx.next_id,
+                                ctx.toolbar,
+                                NEWTAB_URL,
+                                *ctx.ww,
+                                *ctx.wh,
+                                *ctx.devtools_open,
+                                #[cfg(target_os = "windows")]
+                                ctx.devtools_panel,
+                            );
+                        } else {
+                            if idx < *ctx.current {
+                                *ctx.current -= 1;
+                            } else {
+                                *ctx.current = (*ctx.current).min(ctx.tabs.len() - 1);
+                            }
+                            show_tab(
+                                ctx.window,
+                                ctx.tabs,
+                                *ctx.current,
+                                ctx.toolbar,
+                                *ctx.devtools_open,
+                                *ctx.ww,
+                                *ctx.wh,
+                                #[cfg(target_os = "windows")]
+                                ctx.devtools_panel,
+                            );
+                            sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
@@ -2045,188 +2279,42 @@ fn main() {
             Event::UserEvent(UserEvent::Ipc(msg)) => {
                 #[cfg(target_os = "windows")]
                 log_windows_ipc(&msg);
-                match msg.as_str() {
-                "win_drag" => {
-                    let _ = window.drag_window();
-                }
-                "win_min" => window.set_minimized(true),
-                "win_max_toggle" => {
-                    let m = window.is_maximized();
-                    window.set_maximized(!m);
-                    (ww, wh) = logical_size(&window);
-                    resize_all(
-                        &window,
-                        &toolbar,
-                        &tabs,
-                        ww,
-                        wh,
-                        devtools_open,
-                        #[cfg(target_os = "windows")]
-                        Some(&devtools_panel),
-                    );
-                    raise_toolbar(
-                        &toolbar,
-                        &window,
-                        Some(&tabs),
-                        #[cfg(target_os = "windows")]
-                        Some(&devtools_panel),
-                    );
-                    sync_toolbar(&toolbar, &tabs, current);
-                }
-                "win_close" => *control_flow = ControlFlow::Exit,
-
-                "ready" => {
-                    #[cfg(not(target_os = "windows"))]
-                    sync_toolbar(&toolbar, &tabs, current);
-                    raise_toolbar(
-                        &toolbar,
-                        &window,
-                        Some(&tabs),
-                        #[cfg(target_os = "windows")]
-                        Some(&devtools_panel),
-                    );
+                let mut ipc_ctx = IpcContext {
+                    control_flow,
+                    window: &window,
+                    toolbar: &toolbar,
+                    tabs: &mut tabs,
+                    current: &mut current,
+                    next_id: &mut next_id,
+                    proxy: &proxy,
+                    ww: &mut ww,
+                    wh: &mut wh,
+                    devtools_open: &mut devtools_open,
                     #[cfg(target_os = "windows")]
-                    log_windows_layout(&toolbar, &tabs, "toolbar_ready");
-                }
-
-                "focus_content" => focus_active_tab(&tabs, current),
-
-                "nav_back" => {
-                    webview_go_back(&tabs[current].webview);
-                    focus_active_tab(&tabs, current);
-                }
-                "nav_forward" => {
-                    webview_go_forward(&tabs[current].webview);
-                    focus_active_tab(&tabs, current);
-                }
-                "nav_reload" => {
-                    let _ = tabs[current].webview.reload();
-                    focus_active_tab(&tabs, current);
-                }
-
-                "nav_devtools" => {
-                    toggle_devtools(
-                        &window,
-                        &toolbar,
-                        &tabs,
-                        current,
-                        &mut devtools_open,
-                        ww,
-                        wh,
-                        #[cfg(target_os = "windows")]
-                        Some(&devtools_panel),
-                    );
-                }
-
-                _ if msg.starts_with("load:") => {
-                    if let Some(rest) = msg.strip_prefix("load:") {
-                        if let Some(url) = resolve_omnibox_input(rest) {
-                            tabs[current].url = url.clone();
-                            tabs[current].title.clear();
-                            let _ = tabs[current].webview.load_url(&url);
-                            #[cfg(not(target_os = "windows"))]
-                            let _ = tabs[current].webview.focus();
-                            sync_toolbar(&toolbar, &tabs, current);
-                            raise_toolbar(
-                                &toolbar,
-                                &window,
-                                Some(&tabs),
-                                #[cfg(target_os = "windows")]
-                                Some(&devtools_panel),
-                            );
-                        }
-                    }
-                }
-
-                _ if msg.starts_with("new_tab:") => {
-                    open_new_tab(
-                        &window,
-                        &proxy,
-                        &mut tabs,
-                        &mut current,
-                        &mut next_id,
-                        &toolbar,
-                        NEWTAB_URL,
-                        ww,
-                        wh,
-                        devtools_open,
-                        #[cfg(target_os = "windows")]
-                        Some(&devtools_panel),
-                    );
-                }
-
-                _ if msg.starts_with("switch_tab:") => {
-                    if let Some(rest) = msg.strip_prefix("switch_tab:") {
-                        if let Ok(idx) = rest.trim().parse::<usize>() {
-                            if idx < tabs.len() {
-                                current = idx;
-                                show_tab(
-                                    &window,
-                                    &tabs,
-                                    current,
-                                    &toolbar,
-                                    devtools_open,
-                                    ww,
-                                    wh,
-                                    #[cfg(target_os = "windows")]
-                                    Some(&devtools_panel),
-                                );
-                                sync_toolbar(&toolbar, &tabs, current);
-                            }
-                        }
-                    }
-                }
-
-                _ if msg.starts_with("close_tab:") => {
-                    if let Some(rest) = msg.strip_prefix("close_tab:") {
-                        if let Ok(idx) = rest.trim().parse::<usize>() {
-                            if idx < tabs.len() {
-                                tabs.remove(idx);
-                                if tabs.is_empty() {
-                                    open_new_tab(
-                                        &window,
-                                        &proxy,
-                                        &mut tabs,
-                                        &mut current,
-                                        &mut next_id,
-                                        &toolbar,
-                                        NEWTAB_URL,
-                                        ww,
-                                        wh,
-                                        devtools_open,
-                                        #[cfg(target_os = "windows")]
-                                        Some(&devtools_panel),
-                                    );
-                                } else {
-                                    if idx < current {
-                                        current -= 1;
-                                    } else {
-                                        current = current.min(tabs.len() - 1);
-                                    }
-                                    show_tab(
-                                        &window,
-                                        &tabs,
-                                        current,
-                                        &toolbar,
-                                        devtools_open,
-                                        ww,
-                                        wh,
-                                        #[cfg(target_os = "windows")]
-                                        Some(&devtools_panel),
-                                    );
-                                    sync_toolbar(&toolbar, &tabs, current);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                _ => {}
-                }
+                    devtools_panel: Some(&devtools_panel),
+                };
+                process_ipc(&msg, &mut ipc_ctx);
             },
 
             #[cfg(target_os = "windows")]
             Event::MainEventsCleared => {
+                for msg in drain_ipc_inbox() {
+                    log_windows_ipc(&msg);
+                    let mut ipc_ctx = IpcContext {
+                        control_flow,
+                        window: &window,
+                        toolbar: &toolbar,
+                        tabs: &mut tabs,
+                        current: &mut current,
+                        next_id: &mut next_id,
+                        proxy: &proxy,
+                        ww: &mut ww,
+                        wh: &mut wh,
+                        devtools_open: &mut devtools_open,
+                        devtools_panel: Some(&devtools_panel),
+                    };
+                    process_ipc(&msg, &mut ipc_ctx);
+                }
                 if z_order_nudges < 60 {
                     raise_toolbar(
                         &toolbar,
@@ -2234,9 +2322,6 @@ fn main() {
                         Some(&tabs),
                         Some(&devtools_panel),
                     );
-                    if z_order_nudges % 5 == 0 {
-                        sync_toolbar(&toolbar, &tabs, current);
-                    }
                     z_order_nudges += 1;
                 }
             }
