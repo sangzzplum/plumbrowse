@@ -21,7 +21,7 @@ use wry::{
 use tao::platform::macos::WindowBuilderExtMacOS;
 
 #[cfg(target_os = "windows")]
-use wry::{Theme, WebViewBuilderExtWindows, WebViewExtWindows};
+use wry::{Theme, WebViewBuilderExtWindows};
 
 fn logical_size(window: &Window) -> (f64, f64) {
     let size = window
@@ -60,10 +60,10 @@ fn raise_toolbar(toolbar: &WebView, window: &Window) {
 
     #[cfg(target_os = "windows")]
     {
-        use tao::platform::windows::WindowExtWindows;
-        use wry::WebViewExtWindows;
-
-        let _ = toolbar.reparent(window.hwnd());
+        let (ww, _) = logical_size(window);
+        let _ = toolbar.set_bounds(bounds_toolbar(ww));
+        let _ = toolbar.set_visible(true);
+        let _ = toolbar.focus();
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -458,7 +458,15 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
 
 const TOOLBAR_SCRIPT: &str = r#"
     function post(msg) {
-      if (window.ipc && window.ipc.postMessage) window.ipc.postMessage(msg);
+      try {
+        if (window.ipc && window.ipc.postMessage) {
+          window.ipc.postMessage(msg);
+          return;
+        }
+        if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+          window.chrome.webview.postMessage(msg);
+        }
+      } catch (e) {}
     }
 
     function svgFallbackDataUrl() {
@@ -701,6 +709,7 @@ const TAB_BAR_CSS: &str = r#"
 
 fn toolbar_html() -> String {
     let toolbar_h = toolbar_height() as i32;
+    let version = version_label();
 
     if cfg!(target_os = "macos") {
         return format!(
@@ -788,7 +797,7 @@ fn toolbar_html() -> String {
     }}
     .drag {{ flex:1; height:100%; display:flex; align-items:center; color:var(--mut); font-weight:700; -webkit-app-region:drag; }}
     .winbtns {{ display:flex; gap:8px; -webkit-app-region:no-drag; }}
-    .wbtn {{ width:40px; height:26px; border-radius:10px; background:var(--b); display:grid; place-items:center; cursor:pointer; }}
+    .wbtn {{ width:40px; height:26px; border-radius:10px; background:var(--b); display:grid; place-items:center; cursor:pointer; -webkit-app-region:no-drag; }}
     .wbtn:hover {{ background:var(--b2); }}
     .wbtn.close {{ background:var(--danger); }}
     .toolbar {{ flex:1; display:flex; flex-direction:column; gap:8px; padding:8px 12px 10px; -webkit-app-region:no-drag; min-height:0; overflow:visible; }}
@@ -813,26 +822,26 @@ fn toolbar_html() -> String {
 <body>
   <div class="chrome">
     <div class="titlebar">
-      <div class="drag" id="drag">PlumBrowser</div>
+      <div class="drag" id="drag" data-wry-drag-region>{version}</div>
       <div class="winbtns">
-        <div class="wbtn" id="min" title="Свернуть">—</div>
-        <div class="wbtn" id="max" title="Развернуть">□</div>
-        <div class="wbtn close" id="close" title="Закрыть">×</div>
+        <div class="wbtn" id="min" title="Свернуть" onclick="post('win_min')">—</div>
+        <div class="wbtn" id="max" title="Развернуть" onclick="post('win_max_toggle')">□</div>
+        <div class="wbtn close" id="close" title="Закрыть" onclick="post('win_close')">×</div>
       </div>
     </div>
     <div class="toolbar">
       <div class="tabs-bar">
         <div class="tab-strip" id="tab-strip"></div>
-        <div class="addtab" id="addtab-inline" title="Новая вкладка">+</div>
-        <div class="addtab" id="addtab-fixed" title="Новая вкладка" style="display:none">+</div>
+        <div class="addtab" id="addtab-inline" title="Новая вкладка" onclick="post('new_tab:')">+</div>
+        <div class="addtab" id="addtab-fixed" title="Новая вкладка" style="display:none" onclick="post('new_tab:')">+</div>
       </div>
       <div class="row">
-        <div class="navbtn" id="back" title="Назад">←</div>
-        <div class="navbtn" id="forward" title="Вперёд">→</div>
-        <div class="navbtn" id="reload" title="Обновить">↻</div>
-        <div class="navbtn" id="devtools" title="Инструменты разработчика (F12)">&#123; &#125;</div>
-        <input id="url" placeholder="example.com или https://example.com" autocomplete="off" spellcheck="false" />
-        <div class="go" id="go">Go</div>
+        <div class="navbtn" id="back" title="Назад" onclick="post('nav_back')">←</div>
+        <div class="navbtn" id="forward" title="Вперёд" onclick="post('nav_forward')">→</div>
+        <div class="navbtn" id="reload" title="Обновить" onclick="post('nav_reload')">↻</div>
+        <div class="navbtn" id="devtools" title="Инструменты разработчика (F12)" onclick="post('nav_devtools')">&#123; &#125;</div>
+        <input id="url" placeholder="адрес или поиск" autocomplete="off" spellcheck="false" />
+        <div class="go" id="go" onclick="post('load:' + document.getElementById('url').value)">Go</div>
       </div>
     </div>
   </div>
@@ -840,7 +849,8 @@ fn toolbar_html() -> String {
 </body>
 </html>"#,
         script = TOOLBAR_SCRIPT,
-        tab_bar_css = TAB_BAR_CSS
+        tab_bar_css = TAB_BAR_CSS,
+        version = version
     )
 }
 
@@ -1037,7 +1047,7 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         .with_bounds(bounds_toolbar(ww))
         .with_background_color(TOOLBAR_BG)
         .with_visible(true)
-        .with_focused(false)
+        .with_focused(cfg!(target_os = "windows"))
         .with_accept_first_mouse(true)
         .with_devtools(false)
         .with_hotkeys_zoom(false)
@@ -1075,7 +1085,6 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
     #[cfg(target_os = "windows")]
     {
         let _ = toolbar.set_theme(Theme::Dark);
-        raise_toolbar(&toolbar, window);
     }
 
     toolbar
@@ -1212,10 +1221,6 @@ fn main() {
     let mut devtools_open = false;
     let mut modifiers = ModifiersState::empty();
 
-    // Windows: create toolbar before content webviews (z-order + WebView2 env).
-    #[cfg(target_os = "windows")]
-    let toolbar = build_toolbar(&window, proxy.clone(), ww);
-
     let first_webview = build_content_webview(
         &window,
         proxy.clone(),
@@ -1236,13 +1241,13 @@ fn main() {
     }];
     let mut current: usize = 0;
 
-    #[cfg(not(target_os = "windows"))]
+    // Toolbar last — on Windows it must be the topmost child webview (clicks + z-order).
+    #[cfg(target_os = "windows")]
+    let devtools_panel = build_devtools_panel(&window, ww, wh);
+
     let toolbar = build_toolbar(&window, proxy.clone(), ww);
 
     raise_toolbar(&toolbar, &window);
-
-    #[cfg(target_os = "windows")]
-    let devtools_panel = build_devtools_panel(&window, ww, wh);
 
     #[cfg(target_os = "windows")]
     {
@@ -1285,6 +1290,7 @@ fn main() {
                         Some(&devtools_panel),
                     );
                     raise_toolbar(&toolbar, &window);
+                    sync_toolbar(&toolbar, &tabs, current);
                 }
 
                 WindowEvent::ScaleFactorChanged {
@@ -1330,7 +1336,10 @@ fn main() {
                     );
                 }
 
-                WindowEvent::Focused(true) => focus_active_tab(&tabs, current),
+                WindowEvent::Focused(true) => {
+                    #[cfg(not(target_os = "windows"))]
+                    focus_active_tab(&tabs, current);
+                }
 
                 _ => {}
             },
@@ -1419,6 +1428,19 @@ fn main() {
                 "win_max_toggle" => {
                     let m = window.is_maximized();
                     window.set_maximized(!m);
+                    (ww, wh) = logical_size(&window);
+                    resize_all(
+                        &window,
+                        &toolbar,
+                        &tabs,
+                        ww,
+                        wh,
+                        devtools_open,
+                        #[cfg(target_os = "windows")]
+                        Some(&devtools_panel),
+                    );
+                    raise_toolbar(&toolbar, &window);
+                    sync_toolbar(&toolbar, &tabs, current);
                 }
                 "win_close" => *control_flow = ControlFlow::Exit,
 
