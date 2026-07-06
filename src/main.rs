@@ -4,6 +4,7 @@
 use serde_json::json;
 use std::borrow::Cow;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 use std::sync::{Mutex, OnceLock};
 use tao::{
@@ -1977,6 +1978,40 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
     }
 }
 
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+fn drain_and_process_ipc(
+    control_flow: &mut ControlFlow,
+    window: &Window,
+    toolbar: &WebView,
+    tabs: &mut Vec<Tab>,
+    current: &mut usize,
+    next_id: &mut u32,
+    proxy: &EventLoopProxy<UserEvent>,
+    ww: &mut f64,
+    wh: &mut f64,
+    devtools_open: &mut bool,
+    devtools_panel: &WebView,
+) {
+    for msg in drain_ipc_inbox() {
+        log_windows_debug(&format!("handled ipc: {msg}"));
+        let mut ipc_ctx = IpcContext {
+            control_flow,
+            window,
+            toolbar,
+            tabs,
+            current,
+            next_id,
+            proxy,
+            ww,
+            wh,
+            devtools_open,
+            devtools_panel: Some(devtools_panel),
+        };
+        process_ipc(&msg, &mut ipc_ctx);
+    }
+}
+
 fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
     let mut builder = WindowBuilder::new()
         .with_title(version_label())
@@ -2089,7 +2124,28 @@ fn main() {
     log_windows_layout(&toolbar, &tabs, "startup");
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        #[cfg(target_os = "windows")]
+        {
+            drain_and_process_ipc(
+                control_flow,
+                &window,
+                &toolbar,
+                &mut tabs,
+                &mut current,
+                &mut next_id,
+                &proxy,
+                &mut ww,
+                &mut wh,
+                &mut devtools_open,
+                &devtools_panel,
+            );
+            *control_flow =
+                ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(8));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            *control_flow = ControlFlow::Wait;
+        }
 
         match event {
             Event::WindowEvent { event, .. } => match event {
@@ -2298,23 +2354,6 @@ fn main() {
 
             #[cfg(target_os = "windows")]
             Event::MainEventsCleared => {
-                for msg in drain_ipc_inbox() {
-                    log_windows_ipc(&msg);
-                    let mut ipc_ctx = IpcContext {
-                        control_flow,
-                        window: &window,
-                        toolbar: &toolbar,
-                        tabs: &mut tabs,
-                        current: &mut current,
-                        next_id: &mut next_id,
-                        proxy: &proxy,
-                        ww: &mut ww,
-                        wh: &mut wh,
-                        devtools_open: &mut devtools_open,
-                        devtools_panel: Some(&devtools_panel),
-                    };
-                    process_ipc(&msg, &mut ipc_ctx);
-                }
                 if z_order_nudges < 60 {
                     raise_toolbar(
                         &toolbar,
