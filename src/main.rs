@@ -1324,14 +1324,14 @@ mod win_devtools {
     use std::thread;
     use std::time::Duration;
 
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumChildWindows, EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW,
         GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, MoveWindow, PostMessageW,
         SetParent, ShowWindow, GWL_STYLE, SW_SHOW, WM_CLOSE, WS_CHILD, WS_POPUP,
     };
-    use wry::{dpi::Position, Rect};
+    use wry::dpi::{PhysicalPosition, PhysicalSize, Rect};
 
     static EMBEDDED_HWND: AtomicIsize = AtomicIsize::new(0);
     static PANEL_HOST_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -1344,12 +1344,13 @@ mod win_devtools {
     }
 
     pub fn embed_after_open(panel: Rect, scale: f64) {
-        let parent = panel_host();
+        let parent_hwnd = PANEL_HOST_HWND.load(Ordering::SeqCst);
         let local = local_panel_rect(panel, scale);
         thread::spawn(move || {
             for _ in 0..80 {
                 thread::sleep(Duration::from_millis(50));
                 if let Some(devtools) = find_devtools_window() {
+                    let parent = hwnd_from_isize(parent_hwnd);
                     embed_window(devtools, parent, &local);
                     EMBEDDED_HWND.store(devtools.0 as isize, Ordering::SeqCst);
                     return;
@@ -1374,20 +1375,19 @@ mod win_devtools {
         let hwnd = EMBEDDED_HWND.load(Ordering::SeqCst);
         if hwnd != 0 {
             unsafe {
-                let _ = PostMessageW(Some(HWND(hwnd as _)), WM_CLOSE, None, None);
+                let _ = PostMessageW(HWND(hwnd as _), WM_CLOSE, WPARAM(0), LPARAM(0));
             }
             EMBEDDED_HWND.store(0, Ordering::SeqCst);
             return;
         }
         if let Some(devtools) = find_devtools_window() {
             unsafe {
-                let _ = PostMessageW(Some(devtools), WM_CLOSE, None, None);
+                let _ = PostMessageW(devtools, WM_CLOSE, WPARAM(0), LPARAM(0));
             }
         }
     }
 
-    fn panel_host() -> HWND {
-        let hwnd = PANEL_HOST_HWND.load(Ordering::SeqCst);
+    fn hwnd_from_isize(hwnd: isize) -> HWND {
         if hwnd != 0 {
             HWND(hwnd as _)
         } else {
@@ -1395,8 +1395,12 @@ mod win_devtools {
         }
     }
 
+    fn panel_host() -> HWND {
+        hwnd_from_isize(PANEL_HOST_HWND.load(Ordering::SeqCst))
+    }
+
     fn local_panel_rect(panel: Rect, scale: f64) -> RECT {
-        let size = panel.size.to_physical(scale);
+        let size: PhysicalSize<f64> = panel.size.to_physical(scale);
         RECT {
             left: 0,
             top: 0,
@@ -1406,13 +1410,13 @@ mod win_devtools {
     }
 
     fn rect_to_physical(panel: Rect, scale: f64) -> RECT {
-        let Position { x, y } = panel.position.to_physical(scale);
-        let size = panel.size.to_physical(scale);
+        let pos: PhysicalPosition<f64> = panel.position.to_physical(scale);
+        let size: PhysicalSize<f64> = panel.size.to_physical(scale);
         RECT {
-            left: x.round() as i32,
-            top: y.round() as i32,
-            right: (x + size.width).round() as i32,
-            bottom: (y + size.height).round() as i32,
+            left: pos.x.round() as i32,
+            top: pos.y.round() as i32,
+            right: (pos.x + size.width).round() as i32,
+            bottom: (pos.y + size.height).round() as i32,
         }
     }
 
@@ -1424,7 +1428,7 @@ mod win_devtools {
         };
         unsafe {
             let _ = EnumChildWindows(
-                Some(HWND(main_hwnd as _)),
+                HWND(main_hwnd as _),
                 Some(enum_child),
                 LPARAM(&mut ctx as *mut _ as isize),
             );
@@ -1464,7 +1468,7 @@ mod win_devtools {
             return;
         }
         unsafe {
-            let _ = SetParent(devtools, Some(parent));
+            let _ = SetParent(devtools, parent);
             let style =
                 windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(devtools, GWL_STYLE)
                     as u32;
