@@ -1550,6 +1550,8 @@ fn show_tab(
             #[cfg(target_os = "windows")]
             if let Some(panel) = devtools_panel {
                 sync_windows_devtools(panel, tab, true);
+            } else {
+                request_devtools_panel();
             }
         }
     }
@@ -1617,8 +1619,11 @@ fn toggle_devtools(
     if *devtools_open {
         close_docked_devtools(&tab.webview);
         #[cfg(target_os = "windows")]
-        if let Some(panel) = devtools_panel {
-            sync_windows_devtools(panel, tab, false);
+        {
+            cancel_devtools_panel_request();
+            if let Some(panel) = devtools_panel {
+                sync_windows_devtools(panel, tab, false);
+            }
         }
         *devtools_open = false;
     } else {
@@ -1627,6 +1632,10 @@ fn toggle_devtools(
         #[cfg(target_os = "windows")]
         if let Some(panel) = devtools_panel {
             sync_windows_devtools(panel, tab, true);
+        }
+        #[cfg(target_os = "windows")]
+        if devtools_panel.is_none() {
+            request_devtools_panel();
         }
     }
 
@@ -1798,6 +1807,8 @@ fn open_new_tab(
         #[cfg(target_os = "windows")]
         if let Some(panel) = devtools_panel {
             sync_windows_devtools(panel, &tabs[*current], true);
+        } else {
+            request_devtools_panel();
         }
     }
     sync_toolbar(toolbar, tabs, *current);
@@ -1906,6 +1917,71 @@ fn tick_devtools_connect(app: &mut WindowsRunState) {
 }
 
 #[cfg(target_os = "windows")]
+fn tick_devtools_panel_build(app: &mut WindowsRunState) {
+    if DEVTOOLS_PANEL_PENDING.swap(false, Ordering::SeqCst) {
+        DEVTOOLS_PANEL_BUILD_NEXT.store(true, Ordering::SeqCst);
+        return;
+    }
+    if !DEVTOOLS_PANEL_BUILD_NEXT.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    if app.devtools_panel.is_some() || !app.devtools_open {
+        return;
+    }
+
+    win_startup("lazy: devtools panel");
+    log_windows_debug("devtools: creating docked panel webview");
+    app.devtools_panel = Some(build_devtools_panel(&app.window, app.ww, app.wh));
+    resize_all(
+        &app.window,
+        &app.toolbar,
+        &app.tabs,
+        app.ww,
+        app.wh,
+        app.devtools_open,
+        app.devtools_panel.as_ref(),
+    );
+    raise_toolbar(
+        &app.toolbar,
+        &app.window,
+        Some(&app.tabs),
+        app.devtools_panel.as_ref(),
+    );
+    if let (Some(panel), Some(tab)) = (
+        app.devtools_panel.as_ref(),
+        app.tabs.get(app.current),
+    ) {
+        sync_windows_devtools(panel, tab, true);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn request_devtools_panel() {
+    DEVTOOLS_PANEL_PENDING.store(true, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "windows")]
+fn cancel_devtools_panel_request() {
+    DEVTOOLS_PANEL_PENDING.store(false, Ordering::SeqCst);
+    DEVTOOLS_PANEL_BUILD_NEXT.store(false, Ordering::SeqCst);
+}
+
+#[cfg(target_os = "windows")]
+fn focus_main_window(window: &Window) {
+    window.set_focus();
+    use tao::platform::windows::WindowExtWindows;
+    use windows::Win32::UI::WindowsAndMessaging::{BringWindowToTop, SetForegroundWindow};
+    let hwnd = window.hwnd();
+    if hwnd != 0 {
+        unsafe {
+            let hwnd = windows::Win32::Foundation::HWND(hwnd as _);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = BringWindowToTop(hwnd);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
 #[derive(Copy, Clone)]
 struct WinAppPtr(*mut UnsafeCell<WindowsRunState>);
 
@@ -1923,6 +1999,12 @@ static TOOLBAR_DIRTY: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 static WIN_IPC_FALLBACK: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static DEVTOOLS_PANEL_PENDING: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "windows")]
+static DEVTOOLS_PANEL_BUILD_NEXT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 static WIN_EXIT: AtomicBool = AtomicBool::new(false);
@@ -2503,9 +2585,6 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
     }
     app.bootstrapped = true;
 
-    win_startup("bootstrap: devtools panel");
-    app.devtools_panel = Some(build_devtools_panel(&app.window, app.ww, app.wh));
-
     win_startup("bootstrap: content webview");
     let webview = build_content_webview(
         &app.window,
@@ -2527,6 +2606,8 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
     app.next_id = 2;
 
     app.window.set_visible(true);
+    focus_main_window(&app.window);
+    log_windows_debug("window shown");
     raise_toolbar(
         &app.toolbar,
         &app.window,
@@ -2591,6 +2672,7 @@ fn run_windows_app(
                 &mut app.modifiers,
                 Some(&mut app.z_order_nudges),
             );
+            tick_devtools_panel_build(app);
         }
     });
 }
