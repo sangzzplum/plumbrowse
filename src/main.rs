@@ -542,8 +542,11 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
 #[cfg(target_os = "windows")]
 fn nudge_toolbar_layout(toolbar: &WebView, ww: f64) {
     // WebView2 иногда не принимает postMessage/клики, пока не случится relayout.
-    let mut shrunk = bounds_toolbar(ww);
-    shrunk.size.height = (shrunk.size.height - 1.0).max(1.0);
+    let h = toolbar_height();
+    let shrunk = Rect {
+        position: LogicalPosition::new(0.0, 0.0).into(),
+        size: LogicalSize::new(ww, (h - 1.0).max(1.0)).into(),
+    };
     let _ = toolbar.set_bounds(shrunk);
     let _ = toolbar.set_bounds(bounds_toolbar(ww));
 }
