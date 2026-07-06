@@ -38,9 +38,51 @@ fn logical_size_from_physical(size: PhysicalSize<u32>, scale: f64) -> (f64, f64)
 fn toolbar_height() -> f64 {
     if cfg!(target_os = "macos") {
         118.0
+    } else if cfg!(target_os = "windows") {
+        // Native title bar — only tabs + nav row (no custom titlebar HTML).
+        108.0
     } else {
         152.0
     }
+}
+
+#[cfg(target_os = "windows")]
+fn log_windows_layout(toolbar: &WebView, tabs: &[Tab], label: &str) {
+    use std::io::Write;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    let path = std::env::temp_dir().join("plumbrowser_debug.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "\n=== {label} ===");
+    let write_rect = |name: &str, hwnd: windows::Win32::Foundation::HWND| {
+        let mut rect = RECT::default();
+        let ok = unsafe { GetWindowRect(hwnd, &mut rect).is_ok() };
+        let _ = writeln!(
+            file,
+            "{name}: hwnd={:?} rect=({},{})-({},{}) ok={ok}",
+            hwnd.0, rect.left, rect.top, rect.right, rect.bottom
+        );
+    };
+
+    if let Some(hwnd) = webview_host_hwnd(toolbar) {
+        write_rect("toolbar", hwnd);
+    } else {
+        let _ = writeln!(file, "toolbar: no hwnd");
+    }
+    for (i, tab) in tabs.iter().enumerate() {
+        if let Some(hwnd) = webview_host_hwnd(&tab.webview) {
+            write_rect(&format!("content[{i}]"), hwnd);
+        }
+    }
+    let _ = writeln!(file, "log: {}", path.display());
 }
 
 /// Поднимаем toolbar поверх content-webview (на macOS и Windows child webviews наслаиваются).
@@ -104,6 +146,7 @@ fn sync_windows_z_order(
     }
     if let Some(host) = webview_host_hwnd(toolbar) {
         unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::BringWindowToTop;
             let _ = SetWindowPos(
                 host,
                 Some(HWND_TOP),
@@ -113,6 +156,7 @@ fn sync_windows_z_order(
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
             );
+            let _ = BringWindowToTop(host);
         }
     }
 }
@@ -275,6 +319,9 @@ fn version_label() -> String {
 fn toolbar_navigation_allowed(url: &str) -> bool {
     // WebView2 maps custom schemes to http(s)://plum.* — must allow those through.
     if url.starts_with("http://plum.") || url.starts_with("https://plum.") {
+        return true;
+    }
+    if url.starts_with("plum://") {
         return true;
     }
     !url.starts_with("http://")
@@ -834,7 +881,6 @@ const WINDOWS_TAB_BAR_CSS: &str = r#"
 
 fn toolbar_html() -> String {
     let toolbar_h = toolbar_height() as i32;
-    let version = version_label();
 
     if cfg!(target_os = "macos") {
         return format!(
@@ -908,26 +954,13 @@ fn toolbar_html() -> String {
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
     :root {{
-      --bg:#202124; --fg:#e8eaed; --mut:#9aa0a6; --b:#303134; --b2:#3c4043; --danger:#5b2b2b;
-      --toolbarH:{toolbar_h}px; --titlebarH:44px;
+      --bg:#202124; --fg:#e8eaed; --mut:#9aa0a6; --b:#303134; --b2:#3c4043;
+      --toolbarH:{toolbar_h}px;
     }}
     * {{ box-sizing:border-box; }}
     html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#202124; }}
     body {{ background:var(--bg); color:var(--fg); font:14px/1.2 system-ui,"Segoe UI",Arial; }}
     .chrome {{ height:var(--toolbarH); display:flex; flex-direction:column; }}
-    .titlebar {{
-      height:var(--titlebarH); display:flex; align-items:center; gap:10px;
-      padding:0 12px; border-bottom:1px solid #2b2c2f;
-      user-select:none; -webkit-user-select:none;
-    }}
-    .drag {{ flex:1; height:100%; display:flex; align-items:center; color:var(--mut); font-weight:700; cursor:default; }}
-    .winbtns {{ display:flex; gap:8px; }}
-    .wbtn {{
-      width:40px; height:26px; border-radius:10px; background:var(--b);
-      display:grid; place-items:center; cursor:pointer; user-select:none;
-    }}
-    .wbtn:hover {{ background:var(--b2); }}
-    .wbtn.close {{ background:var(--danger); }}
     .toolbar {{ flex:1; display:flex; flex-direction:column; gap:8px; padding:8px 12px 10px; min-height:0; overflow:visible; }}
     .tabs-bar {{ flex-shrink:0; }}
     {tab_bar_css}
@@ -948,14 +981,6 @@ fn toolbar_html() -> String {
 </head>
 <body>
   <div class="chrome">
-    <div class="titlebar">
-      <div class="drag" id="drag">{version}</div>
-      <div class="winbtns">
-        <div class="wbtn" id="min" title="Свернуть">—</div>
-        <div class="wbtn" id="max" title="Развернуть">□</div>
-        <div class="wbtn close" id="close" title="Закрыть">×</div>
-      </div>
-    </div>
     <div class="toolbar">
       <div class="tabs-bar">
         <div class="tab-strip" id="tab-strip"></div>
@@ -977,7 +1002,6 @@ fn toolbar_html() -> String {
 </html>"#,
         script = TOOLBAR_SCRIPT,
         tab_bar_css = format!("{TAB_BAR_CSS}\n{WINDOWS_TAB_BAR_CSS}"),
-        version = version
     )
 }
 
@@ -1182,21 +1206,19 @@ fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
 }
 
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
-    let html = toolbar_html();
     let proxy_page = proxy.clone();
     let proxy_ipc = proxy.clone();
-    let builder = WebViewBuilder::new()
+    let mut builder = WebViewBuilder::new()
         .with_bounds(bounds_toolbar(ww))
         .with_background_color(TOOLBAR_BG)
         .with_visible(true)
-        .with_focused(true)
+        .with_focused(!cfg!(target_os = "windows"))
         .with_accept_first_mouse(true)
         .with_devtools(false)
         .with_hotkeys_zoom(false)
         .with_back_forward_navigation_gestures(false)
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
         .with_initialization_script(TOOLBAR_LOCK_SCRIPT)
-        .with_html(&html)
         .with_navigation_handler(|url| toolbar_navigation_allowed(&url))
         .with_on_page_load_handler(move |event, _| {
             if matches!(event, PageLoadEvent::Finished) {
@@ -1206,6 +1228,19 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         .with_ipc_handler(move |req: Request<String>| {
             let _ = proxy_ipc.send_event(UserEvent::Ipc(req.body().clone()));
         });
+
+    #[cfg(target_os = "windows")]
+    {
+        const TOOLBAR_URL: &str = "plum://toolbar/";
+        builder = builder
+            .with_url(TOOLBAR_URL)
+            .with_custom_protocol("plum".to_string(), plum_protocol);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let html = toolbar_html();
+        builder = builder.with_html(&html);
+    }
 
     #[cfg(target_os = "windows")]
     let builder = builder
@@ -1331,7 +1366,12 @@ fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
             .with_fullsize_content_view(true);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        builder = builder.with_decorations(true);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         builder = builder.with_decorations(false);
     }
@@ -1361,6 +1401,12 @@ fn main() {
     let mut devtools_open = false;
     let mut modifiers = ModifiersState::empty();
 
+    // Windows: toolbar must be created before content webviews or HTML often stays blank (white bar).
+    let toolbar = build_toolbar(&window, proxy.clone(), ww);
+
+    #[cfg(target_os = "windows")]
+    let devtools_panel = build_devtools_panel(&window, ww, wh);
+
     let first_webview = build_content_webview(
         &window,
         proxy.clone(),
@@ -1381,10 +1427,8 @@ fn main() {
     }];
     let mut current: usize = 0;
 
-    let toolbar = build_toolbar(&window, proxy.clone(), ww);
-
     #[cfg(target_os = "windows")]
-    let devtools_panel = build_devtools_panel(&window, ww, wh);
+    let mut z_order_nudges: u32 = 0;
 
     raise_toolbar(
         &toolbar,
@@ -1406,6 +1450,9 @@ fn main() {
     );
 
     sync_toolbar(&toolbar, &tabs, current);
+
+    #[cfg(target_os = "windows")]
+    log_windows_layout(&toolbar, &tabs, "startup");
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -1609,6 +1656,8 @@ fn main() {
                         #[cfg(target_os = "windows")]
                         Some(&devtools_panel),
                     );
+                    #[cfg(target_os = "windows")]
+                    log_windows_layout(&toolbar, &tabs, "toolbar_ready");
                 }
 
                 "focus_content" => focus_active_tab(&tabs, current),
@@ -1745,6 +1794,19 @@ fn main() {
 
                 _ => {}
             },
+
+            #[cfg(target_os = "windows")]
+            Event::MainEventsCleared => {
+                if z_order_nudges < 20 {
+                    raise_toolbar(
+                        &toolbar,
+                        &window,
+                        Some(&tabs),
+                        Some(&devtools_panel),
+                    );
+                    z_order_nudges += 1;
+                }
+            }
 
             _ => {}
         }
