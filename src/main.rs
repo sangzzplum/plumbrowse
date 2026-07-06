@@ -356,7 +356,10 @@ fn webview_go_back(webview: &WebView) {
 }
 
 fn open_docked_devtools(webview: &WebView) {
+    #[cfg(not(target_os = "windows"))]
     webview.open_devtools();
+    #[cfg(target_os = "windows")]
+    let _ = webview;
 }
 
 fn close_docked_devtools(webview: &WebView) {
@@ -385,6 +388,7 @@ fn webview_go_forward(webview: &WebView) {
 }
 
 const NEWTAB_URL: &str = "plum://newtab";
+const DEVTOOLS_WIDTH: f64 = 420.0;
 const TOOLBAR_BG: RGBA = (32, 33, 36, 255);
 
 fn app_version() -> &'static str {
@@ -462,6 +466,43 @@ const CONTENT_SHORTCUT_SCRIPT: &str = r#"
       e.stopPropagation();
       postDevtools();
     }
+  }, true);
+"#;
+
+#[cfg(target_os = "windows")]
+const WIN_CONTENT_CONTEXT_SCRIPT: &str = r#"
+  document.addEventListener('contextmenu', function(e) {
+    var old = document.getElementById('__plum_ctx');
+    if (old) old.remove();
+    var menu = document.createElement('div');
+    menu.id = '__plum_ctx';
+    menu.style.cssText = 'position:fixed;left:' + e.clientX + 'px;top:' + e.clientY + 'px;background:#2b2b2b;color:#eee;border:1px solid #444;border-radius:6px;padding:4px 0;z-index:2147483647;font:13px system-ui,sans-serif;min-width:190px;box-shadow:0 8px 24px rgba(0,0,0,.35)';
+    function addItem(label, fn) {
+      var el = document.createElement('div');
+      el.textContent = label;
+      el.style.cssText = 'padding:8px 14px;cursor:default';
+      el.onmouseenter = function(){ el.style.background = '#3d3d3d'; };
+      el.onmouseleave = function(){ el.style.background = 'transparent'; };
+      el.onmousedown = function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        menu.remove();
+        fn();
+      };
+      menu.appendChild(el);
+    }
+    addItem('Назад', function(){ history.back(); });
+    addItem('Обновить', function(){ location.reload(); });
+    addItem('Просмотреть код', function(){ postDevtools(); });
+    document.documentElement.appendChild(menu);
+    e.preventDefault();
+    e.stopPropagation();
+    setTimeout(function() {
+      document.addEventListener('mousedown', function close(ev) {
+        if (!menu.contains(ev.target)) menu.remove();
+        document.removeEventListener('mousedown', close, true);
+      }, true);
+    }, 0);
   }, true);
 "#;
 
@@ -648,11 +689,26 @@ fn bounds_toolbar(win_w: f64) -> Rect {
     }
 }
 
-fn bounds_content(win_w: f64, win_h: f64, _devtools_open: bool) -> Rect {
+fn bounds_content(win_w: f64, win_h: f64, devtools_open: bool) -> Rect {
     let h = toolbar_height();
+    let devtools_w = if devtools_open && cfg!(target_os = "windows") {
+        DEVTOOLS_WIDTH
+    } else {
+        0.0
+    };
     Rect {
         position: LogicalPosition::new(0.0, h).into(),
-        size: LogicalSize::new(win_w.max(1.0), (win_h - h).max(1.0)).into(),
+        size: LogicalSize::new((win_w - devtools_w).max(1.0), (win_h - h).max(1.0)).into(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn bounds_devtools_panel(win_w: f64, win_h: f64) -> Rect {
+    let h = toolbar_height();
+    let content_w = (win_w - DEVTOOLS_WIDTH).max(1.0);
+    Rect {
+        position: LogicalPosition::new(content_w, h).into(),
+        size: LogicalSize::new(DEVTOOLS_WIDTH, (win_h - h).max(1.0)).into(),
     }
 }
 
@@ -1388,6 +1444,11 @@ fn build_content_webview(
     visible: bool,
     devtools_open: bool,
 ) -> WebView {
+    #[cfg(target_os = "windows")]
+    let content_init = format!("{CONTENT_SHORTCUT_SCRIPT}\n{WIN_CONTENT_CONTEXT_SCRIPT}");
+    #[cfg(not(target_os = "windows"))]
+    let content_init = CONTENT_SHORTCUT_SCRIPT.to_string();
+
     let builder = WebViewBuilder::new()
         .with_user_agent(content_user_agent())
         .with_bounds(bounds_content(ww, wh, devtools_open))
@@ -1397,7 +1458,7 @@ fn build_content_webview(
         .with_back_forward_navigation_gestures(true)
         .with_devtools(true)
         .with_hotkeys_zoom(true)
-        .with_initialization_script(CONTENT_SHORTCUT_SCRIPT)
+        .with_initialization_script(&content_init)
         .with_custom_protocol("plum".to_string(), plum_protocol)
         .with_ipc_handler({
             let proxy = proxy.clone();
@@ -1486,6 +1547,10 @@ fn show_tab(
     if devtools_open {
         if let Some(tab) = tabs.get(current) {
             open_docked_devtools(&tab.webview);
+            #[cfg(target_os = "windows")]
+            if let Some(panel) = devtools_panel {
+                sync_windows_devtools(panel, tab, true);
+            }
         }
     }
     focus_active_tab(tabs, current);
@@ -1512,6 +1577,11 @@ fn resize_all(
     let bounds = bounds_content(ww, wh, devtools_open);
     for tab in tabs {
         let _ = tab.webview.set_bounds(bounds);
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(panel) = devtools_panel {
+        let _ = panel.set_bounds(bounds_devtools_panel(ww, wh));
+        let _ = panel.set_visible(devtools_open);
     }
     #[cfg(target_os = "windows")]
     sync_windows_z_order(toolbar, tabs, devtools_panel);
@@ -1544,27 +1614,20 @@ fn toggle_devtools(
         return;
     };
 
-    #[cfg(target_os = "windows")]
-    {
-        let _ = (
-            window,
-            toolbar,
-            devtools_open,
-            ww,
-            wh,
-            devtools_panel,
-        );
-        log_windows_debug("devtools: OpenDevToolsWindow");
-        tab.webview.open_devtools();
-        return;
-    }
-
     if *devtools_open {
         close_docked_devtools(&tab.webview);
+        #[cfg(target_os = "windows")]
+        if let Some(panel) = devtools_panel {
+            sync_windows_devtools(panel, tab, false);
+        }
         *devtools_open = false;
     } else {
         *devtools_open = true;
         open_docked_devtools(&tab.webview);
+        #[cfg(target_os = "windows")]
+        if let Some(panel) = devtools_panel {
+            sync_windows_devtools(panel, tab, true);
+        }
     }
 
     resize_all(
@@ -1636,6 +1699,10 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         builder
             .with_url(&windows_toolbar_data_url(&initial))
             .with_custom_protocol("plum".to_string(), plum_protocol)
+            .with_additional_browser_args(
+                "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+                 --remote-debugging-port=9222",
+            )
     };
 
     #[cfg(not(target_os = "windows"))]
@@ -1656,6 +1723,31 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
     }
 
     toolbar
+}
+
+#[cfg(target_os = "windows")]
+const DEVTOOLS_PANEL_HTML: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"/><style>
+  html,body{margin:0;height:100%;background:#1e1e1e;overflow:hidden}
+</style></head><body></body></html>"#;
+
+#[cfg(target_os = "windows")]
+fn build_devtools_panel(window: &Window, ww: f64, wh: f64) -> WebView {
+    WebViewBuilder::new()
+        .with_html(DEVTOOLS_PANEL_HTML)
+        .with_bounds(bounds_devtools_panel(ww, wh))
+        .with_background_color((30, 30, 30, 255))
+        .with_visible(false)
+        .with_devtools(false)
+        .with_hotkeys_zoom(false)
+        .with_navigation_handler(|url| {
+            url.starts_with("http://127.0.0.1:9222") || url.starts_with("about:")
+        })
+        .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+        .with_default_context_menus(false)
+        .with_browser_accelerator_keys(false)
+        .build_as_child(window)
+        .expect("failed to build devtools panel")
 }
 
 fn open_new_tab(
@@ -1703,6 +1795,10 @@ fn open_new_tab(
     *current = tabs.len() - 1;
     if devtools_open {
         open_docked_devtools(&tabs[*current].webview);
+        #[cfg(target_os = "windows")]
+        if let Some(panel) = devtools_panel {
+            sync_windows_devtools(panel, &tabs[*current], true);
+        }
     }
     sync_toolbar(toolbar, tabs, *current);
     resize_all(
@@ -1740,6 +1836,73 @@ struct WindowsRunState {
     z_order_nudges: u32,
     proxy: EventLoopProxy<UserEvent>,
     bootstrapped: bool,
+}
+
+#[cfg(target_os = "windows")]
+struct DevtoolsConnectState {
+    page_url: String,
+    attempts: u32,
+}
+
+#[cfg(target_os = "windows")]
+const DEVTOOLS_CONNECT_MAX: u32 = 150;
+
+#[cfg(target_os = "windows")]
+fn devtools_connect_slot() -> &'static Mutex<Option<DevtoolsConnectState>> {
+    static SLOT: OnceLock<Mutex<Option<DevtoolsConnectState>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(target_os = "windows")]
+fn sync_windows_devtools(panel: &WebView, tab: &Tab, open: bool) {
+    if open {
+        let page_url = logical_tab_url(&tab.url);
+        *devtools_connect_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(DevtoolsConnectState {
+            page_url,
+            attempts: 0,
+        });
+        let _ = panel.set_visible(true);
+        log_windows_debug("devtools: connecting docked panel");
+    } else {
+        *devtools_connect_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        win_devtools::close_panel(panel);
+        log_windows_debug("devtools: docked panel closed");
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn tick_devtools_connect(app: &mut WindowsRunState) {
+    let mut slot = devtools_connect_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(state) = slot.as_mut() else {
+        return;
+    };
+    if !app.devtools_open {
+        *slot = None;
+        return;
+    }
+    let Some(panel) = app.devtools_panel.as_ref() else {
+        *slot = None;
+        return;
+    };
+
+    if let Some(url) = win_devtools::inspector_url_for_page(&state.page_url) {
+        log_windows_debug("devtools: inspector ready");
+        let _ = panel.load_url(&url);
+        *slot = None;
+        return;
+    }
+
+    state.attempts += 1;
+    if state.attempts >= DEVTOOLS_CONNECT_MAX {
+        log_windows_debug("devtools: CDP connect timed out (is port 9222 up?)");
+        *slot = None;
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2340,6 +2503,9 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
     }
     app.bootstrapped = true;
 
+    win_startup("bootstrap: devtools panel");
+    app.devtools_panel = Some(build_devtools_panel(&app.window, app.ww, app.wh));
+
     win_startup("bootstrap: content webview");
     let webview = build_content_webview(
         &app.window,
@@ -2402,6 +2568,7 @@ fn run_windows_app(
         unsafe {
             bootstrap_win_app(win_app_mut(app_ptr));
             drain_pending_ipc(app_ptr, control_flow);
+            tick_devtools_connect(win_app_mut(app_ptr));
         }
         if *control_flow == ControlFlow::Exit {
             return;
@@ -2550,5 +2717,103 @@ fn main() {
                 None,
             );
         });
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod win_devtools {
+    use serde_json::Value;
+    use std::time::Duration;
+    use wry::WebView;
+
+    const CDP_BASE: &str = "http://127.0.0.1:9222";
+
+    pub fn close_panel(panel: &WebView) {
+        let _ = panel.set_visible(false);
+        let _ = panel.load_url("about:blank");
+    }
+
+    pub fn inspector_url_for_page(page_url: &str) -> Option<String> {
+        let targets = fetch_targets()?;
+        pick_target(&targets, page_url).and_then(|target| {
+            if let Some(path) = target.get("devtoolsFrontendUrl").and_then(|v| v.as_str()) {
+                return Some(frontend_url(path));
+            }
+            let ws = target.get("webSocketDebuggerUrl")?.as_str()?;
+            Some(format!(
+                "{CDP_BASE}/devtools/inspector.html?ws={}",
+                ws.trim_start_matches("ws://")
+            ))
+        })
+    }
+
+    fn frontend_url(path: &str) -> String {
+        if path.starts_with("http://") || path.starts_with("https://") {
+            path.to_string()
+        } else {
+            format!("{CDP_BASE}{path}")
+        }
+    }
+
+    fn fetch_targets() -> Option<Vec<Value>> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_millis(120))
+            .timeout_read(Duration::from_millis(120))
+            .build();
+        for endpoint in ["/json/list", "/json"] {
+            if let Ok(resp) = agent.get(&format!("{CDP_BASE}{endpoint}")).call() {
+                if let Ok(targets) = resp.into_json::<Vec<Value>>() {
+                    if !targets.is_empty() {
+                        return Some(targets);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn normalize_url(url: &str) -> String {
+        url.trim_end_matches('/').to_string()
+    }
+
+    fn urls_match(a: &str, b: &str) -> bool {
+        normalize_url(a) == normalize_url(b)
+    }
+
+    fn target_matches_page(target_url: &str, page_url: &str) -> bool {
+        if urls_match(target_url, page_url) {
+            return true;
+        }
+        let target = normalize_url(target_url);
+        let page = normalize_url(page_url);
+        if page == "plum://newtab" {
+            return target.contains("newtab")
+                || target.starts_with("data:text/html")
+                || target.contains("plum.newtab");
+        }
+        false
+    }
+
+    fn pick_target<'a>(targets: &'a [Value], page_url: &str) -> Option<&'a Value> {
+        let pages: Vec<&Value> = targets
+            .iter()
+            .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+            .collect();
+
+        pages
+            .iter()
+            .copied()
+            .find(|t| {
+                t.get("url")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|u| target_matches_page(u, page_url))
+            })
+            .or_else(|| {
+                pages
+                    .iter()
+                    .copied()
+                    .find(|t| t.get("url").and_then(|v| v.as_str()).is_some_and(|u| !u.is_empty()))
+            })
+            .or_else(|| pages.last().copied())
     }
 }

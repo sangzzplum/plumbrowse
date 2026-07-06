@@ -1,6 +1,6 @@
 [package]
 name = "plumbrowser"
-version = "1.0.42"
+version = "1.0.43"
 edition = "2021"
 build = "build.rs"
 
@@ -8,6 +8,7 @@ build = "build.rs"
 tao = "0.29"
 wry = { version = "0.53.5", features = ["devtools"] }
 serde_json = "1"
+ureq = { version = "2.12", default-features = false, features = ["json"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [build-dependencies]
