@@ -60,10 +60,32 @@ fn raise_toolbar(toolbar: &WebView, window: &Window) {
 
     #[cfg(target_os = "windows")]
     {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        };
+        use wry::WebViewExtWindows;
+
         let (ww, _) = logical_size(window);
         let _ = toolbar.set_bounds(bounds_toolbar(ww));
         let _ = toolbar.set_visible(true);
-        let _ = toolbar.focus();
+
+        // Content webviews are created after toolbar and steal z-order — put toolbar on top.
+        let controller = toolbar.controller();
+        let mut host = HWND::default();
+        unsafe {
+            if controller.ParentWindow(&mut host).is_ok() {
+                let _ = SetWindowPos(
+                    host,
+                    HWND_TOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -869,7 +891,7 @@ fn build_content_webview(
         .with_user_agent(content_user_agent())
         .with_bounds(bounds_content(ww, wh, devtools_open))
         .with_visible(visible)
-        .with_focused(visible)
+        .with_focused(if cfg!(target_os = "windows") { false } else { visible })
         .with_clipboard(true)
         .with_back_forward_navigation_gestures(true)
         .with_devtools(!cfg!(target_os = "windows"))
@@ -1221,6 +1243,10 @@ fn main() {
     let mut devtools_open = false;
     let mut modifiers = ModifiersState::empty();
 
+    // Windows: toolbar FIRST so WebView2 reliably renders the HTML chrome.
+    #[cfg(target_os = "windows")]
+    let toolbar = build_toolbar(&window, proxy.clone(), ww);
+
     let first_webview = build_content_webview(
         &window,
         proxy.clone(),
@@ -1241,11 +1267,11 @@ fn main() {
     }];
     let mut current: usize = 0;
 
-    // Toolbar last — on Windows it must be the topmost child webview (clicks + z-order).
+    #[cfg(not(target_os = "windows"))]
+    let toolbar = build_toolbar(&window, proxy.clone(), ww);
+
     #[cfg(target_os = "windows")]
     let devtools_panel = build_devtools_panel(&window, ww, wh);
-
-    let toolbar = build_toolbar(&window, proxy.clone(), ww);
 
     raise_toolbar(&toolbar, &window);
 
