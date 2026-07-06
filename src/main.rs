@@ -1625,8 +1625,6 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         })
         .with_on_page_load_handler(move |event, _| {
             if matches!(event, PageLoadEvent::Finished) {
-                #[cfg(target_os = "windows")]
-                enqueue_ipc("ready".to_string());
                 #[cfg(not(target_os = "windows"))]
                 let _ = proxy_page.send_event(UserEvent::Ipc("ready".to_string()));
             }
@@ -1813,6 +1811,7 @@ fn install_win_ipc_host(
         devtools_panel: (devtools_panel as *const WebView).cast(),
     };
     let _ = WIN_IPC_HOST.set(host);
+    log_windows_debug("win ipc host installed");
     let pending = win_ipc_fallback()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2080,6 +2079,258 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
     }
 }
 
+#[cfg(target_os = "windows")]
+struct WindowsRunState {
+    window: Window,
+    toolbar: WebView,
+    devtools_panel: WebView,
+    tabs: Vec<Tab>,
+    current: usize,
+    next_id: u32,
+    ww: f64,
+    wh: f64,
+    devtools_open: bool,
+    modifiers: ModifiersState,
+    z_order_nudges: u32,
+    proxy: EventLoopProxy<UserEvent>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_app_event(
+    event: Event<'_, UserEvent>,
+    control_flow: &mut ControlFlow,
+    window: &Window,
+    toolbar: &WebView,
+    devtools_panel: Option<&WebView>,
+    tabs: &mut Vec<Tab>,
+    current: &mut usize,
+    next_id: &mut u32,
+    proxy: &EventLoopProxy<UserEvent>,
+    ww: &mut f64,
+    wh: &mut f64,
+    devtools_open: &mut bool,
+    modifiers: &mut ModifiersState,
+    z_order_nudges: Option<&mut u32>,
+) {
+    match event {
+        Event::WindowEvent { event, .. } => match event {
+            WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+
+            WindowEvent::Resized(sz) => {
+                let scale = window.scale_factor();
+                (*ww, *wh) = logical_size_from_physical(sz, scale);
+                resize_all(
+                    window,
+                    toolbar,
+                    tabs,
+                    *ww,
+                    *wh,
+                    *devtools_open,
+                    #[cfg(target_os = "windows")]
+                    devtools_panel,
+                );
+                raise_toolbar(
+                    toolbar,
+                    window,
+                    Some(tabs),
+                    #[cfg(target_os = "windows")]
+                    devtools_panel,
+                );
+                sync_toolbar(toolbar, tabs, *current);
+            }
+
+            #[cfg(target_os = "windows")]
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(panel) = devtools_panel {
+                    let scale = window.scale_factor();
+                    let y = position.to_logical::<f64>(scale).y;
+                    if y < toolbar_height() {
+                        raise_toolbar(toolbar, window, Some(tabs), Some(panel));
+                        let _ = toolbar.focus();
+                    }
+                }
+            }
+
+            WindowEvent::ScaleFactorChanged {
+                scale_factor,
+                new_inner_size,
+            } => {
+                (*ww, *wh) = logical_size_from_physical(*new_inner_size, scale_factor);
+                resize_all(
+                    window,
+                    toolbar,
+                    tabs,
+                    *ww,
+                    *wh,
+                    *devtools_open,
+                    #[cfg(target_os = "windows")]
+                    devtools_panel,
+                );
+                raise_toolbar(
+                    toolbar,
+                    window,
+                    Some(tabs),
+                    #[cfg(target_os = "windows")]
+                    devtools_panel,
+                );
+            }
+
+            WindowEvent::ModifiersChanged(m) => *modifiers = m,
+
+            WindowEvent::KeyboardInput {
+                event:
+                    tao::event::KeyEvent {
+                        physical_key,
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if devtools_shortcut(physical_key, *modifiers) => {
+                toggle_devtools(
+                    window,
+                    toolbar,
+                    tabs,
+                    *current,
+                    devtools_open,
+                    *ww,
+                    *wh,
+                    #[cfg(target_os = "windows")]
+                    devtools_panel,
+                );
+            }
+
+            WindowEvent::Focused(true) => {
+                #[cfg(not(target_os = "windows"))]
+                focus_active_tab(tabs, *current);
+            }
+
+            _ => {}
+        },
+
+        Event::UserEvent(UserEvent::ToggleDevtools) => {
+            toggle_devtools(
+                window,
+                toolbar,
+                tabs,
+                *current,
+                devtools_open,
+                *ww,
+                *wh,
+                #[cfg(target_os = "windows")]
+                devtools_panel,
+            );
+        }
+
+        Event::UserEvent(UserEvent::FocusTab { tab_id }) => {
+            if let Some(idx) = find_tab_idx(tabs, tab_id) {
+                if idx == *current {
+                    focus_active_tab(tabs, *current);
+                }
+            }
+        }
+
+        Event::UserEvent(UserEvent::Navigated { tab_id, url }) => {
+            if url == "about:blank" {
+                return;
+            }
+            if let Some(idx) = find_tab_idx(tabs, tab_id) {
+                tabs[idx].url = url;
+                if idx == *current {
+                    sync_toolbar(toolbar, tabs, *current);
+                    focus_active_tab(tabs, *current);
+                } else {
+                    #[cfg(target_os = "windows")]
+                    sync_toolbar(toolbar, tabs, *current);
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        let titles = tabs.iter().map(tab_label).collect::<Vec<_>>();
+                        let script = format!(
+                            "window.__setTabTitle({}, {});",
+                            idx,
+                            json!(titles[idx])
+                        );
+                        let _ = toolbar.evaluate_script(&script);
+                    }
+                }
+            }
+        }
+
+        Event::UserEvent(UserEvent::TitleChanged { tab_id, title }) => {
+            if let Some(idx) = find_tab_idx(tabs, tab_id) {
+                tabs[idx].title = title;
+                #[cfg(target_os = "windows")]
+                sync_toolbar(toolbar, tabs, *current);
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let titles = tabs.iter().map(tab_label).collect::<Vec<_>>();
+                    let script = format!(
+                        "window.__setTabTitle({}, {});",
+                        idx,
+                        json!(titles[idx])
+                    );
+                    let _ = toolbar.evaluate_script(&script);
+                }
+            }
+        }
+
+        Event::UserEvent(UserEvent::NewWindow { url }) => {
+            if let Some(url) = resolve_omnibox_input(&url) {
+                open_new_tab(
+                    window,
+                    proxy,
+                    tabs,
+                    current,
+                    next_id,
+                    toolbar,
+                    &url,
+                    *ww,
+                    *wh,
+                    *devtools_open,
+                    #[cfg(target_os = "windows")]
+                    devtools_panel,
+                );
+            }
+        }
+
+        Event::UserEvent(UserEvent::WakeIpc) => {}
+
+        Event::UserEvent(UserEvent::Ipc(msg)) => {
+            #[cfg(target_os = "windows")]
+            log_windows_ipc(&msg);
+            let mut ipc_ctx = IpcContext {
+                control_flow,
+                window,
+                toolbar,
+                tabs,
+                current,
+                next_id,
+                proxy,
+                ww,
+                wh,
+                devtools_open,
+                #[cfg(target_os = "windows")]
+                devtools_panel: devtools_panel,
+            };
+            process_ipc(&msg, &mut ipc_ctx);
+        }
+
+        #[cfg(target_os = "windows")]
+        Event::MainEventsCleared => {
+            if let Some(nudges) = z_order_nudges {
+                if let Some(panel) = devtools_panel {
+                    if *nudges < 60 {
+                        raise_toolbar(toolbar, window, Some(tabs), Some(panel));
+                        *nudges += 1;
+                    }
+                }
+            }
+        }
+
+        _ => {}
+    }
+}
+
 fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
     let mut builder = WindowBuilder::new()
         .with_title(version_label())
@@ -2192,259 +2443,81 @@ fn main() {
     log_windows_layout(&toolbar, &tabs, "startup");
 
     #[cfg(target_os = "windows")]
-    let mut win_ipc_installed = false;
-
-    event_loop.run(move |event, _, control_flow| {
-        #[cfg(target_os = "windows")]
+    {
+        let mut win_app = Box::new(WindowsRunState {
+            window,
+            toolbar,
+            devtools_panel,
+            tabs,
+            current,
+            next_id,
+            ww,
+            wh,
+            devtools_open,
+            modifiers,
+            z_order_nudges: 0,
+            proxy,
+        });
         {
-            if !win_ipc_installed {
-                install_win_ipc_host(
-                    &window,
-                    &toolbar,
-                    &mut tabs,
-                    &mut current,
-                    &mut next_id,
-                    &proxy,
-                    &mut ww,
-                    &mut wh,
-                    &mut devtools_open,
-                    &devtools_panel,
-                );
-                win_ipc_installed = true;
-            }
+            let app = win_app.as_mut();
+            install_win_ipc_host(
+                &app.window,
+                &app.toolbar,
+                &mut app.tabs,
+                &mut app.current,
+                &mut app.next_id,
+                &app.proxy,
+                &mut app.ww,
+                &mut app.wh,
+                &mut app.devtools_open,
+                &app.devtools_panel,
+            );
+        }
+        event_loop.run(move |event, _, control_flow| {
             if WIN_EXIT.load(Ordering::SeqCst) {
                 *control_flow = ControlFlow::Exit;
             }
             *control_flow =
                 ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            *control_flow = ControlFlow::Wait;
-        }
+            let app = win_app.as_mut();
+            dispatch_app_event(
+                event,
+                control_flow,
+                &app.window,
+                &app.toolbar,
+                Some(&app.devtools_panel),
+                &mut app.tabs,
+                &mut app.current,
+                &mut app.next_id,
+                &app.proxy,
+                &mut app.ww,
+                &mut app.wh,
+                &mut app.devtools_open,
+                &mut app.modifiers,
+                Some(&mut app.z_order_nudges),
+            );
+        });
+    }
 
-        match event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-
-                WindowEvent::Resized(sz) => {
-                    let scale = window.scale_factor();
-                    (ww, wh) = logical_size_from_physical(sz, scale);
-                    resize_all(
-                        &window,
-                        &toolbar,
-                        &tabs,
-                        ww,
-                        wh,
-                        devtools_open,
-                        #[cfg(target_os = "windows")]
-                        Some(&devtools_panel),
-                    );
-                    raise_toolbar(
-                        &toolbar,
-                        &window,
-                        Some(&tabs),
-                        #[cfg(target_os = "windows")]
-                        Some(&devtools_panel),
-                    );
-                    sync_toolbar(&toolbar, &tabs, current);
-                }
-
-                #[cfg(target_os = "windows")]
-                WindowEvent::CursorMoved { position, .. } => {
-                    let scale = window.scale_factor();
-                    let y = position.to_logical::<f64>(scale).y;
-                    if y < toolbar_height() {
-                        raise_toolbar(
-                            &toolbar,
-                            &window,
-                            Some(&tabs),
-                            Some(&devtools_panel),
-                        );
-                        let _ = toolbar.focus();
-                    }
-                }
-
-                WindowEvent::ScaleFactorChanged {
-                    scale_factor,
-                    new_inner_size,
-                } => {
-                    (ww, wh) = logical_size_from_physical(*new_inner_size, scale_factor);
-                    resize_all(
-                        &window,
-                        &toolbar,
-                        &tabs,
-                        ww,
-                        wh,
-                        devtools_open,
-                        #[cfg(target_os = "windows")]
-                        Some(&devtools_panel),
-                    );
-                    raise_toolbar(
-                        &toolbar,
-                        &window,
-                        Some(&tabs),
-                        #[cfg(target_os = "windows")]
-                        Some(&devtools_panel),
-                    );
-                }
-
-                WindowEvent::ModifiersChanged(m) => modifiers = m,
-
-                WindowEvent::KeyboardInput {
-                    event:
-                        tao::event::KeyEvent {
-                            physical_key,
-                            state: ElementState::Pressed,
-                            repeat: false,
-                            ..
-                        },
-                    ..
-                } if devtools_shortcut(physical_key, modifiers) => {
-                    toggle_devtools(
-                        &window,
-                        &toolbar,
-                        &tabs,
-                        current,
-                        &mut devtools_open,
-                        ww,
-                        wh,
-                        #[cfg(target_os = "windows")]
-                        Some(&devtools_panel),
-                    );
-                }
-
-                WindowEvent::Focused(true) => {
-                    #[cfg(not(target_os = "windows"))]
-                    focus_active_tab(&tabs, current);
-                }
-
-                _ => {}
-            },
-
-            Event::UserEvent(UserEvent::ToggleDevtools) => {
-                toggle_devtools(
-                    &window,
-                    &toolbar,
-                    &tabs,
-                    current,
-                    &mut devtools_open,
-                    ww,
-                    wh,
-                    #[cfg(target_os = "windows")]
-                    Some(&devtools_panel),
-                );
-            }
-
-            Event::UserEvent(UserEvent::FocusTab { tab_id }) => {
-                if let Some(idx) = find_tab_idx(&tabs, tab_id) {
-                    if idx == current {
-                        focus_active_tab(&tabs, current);
-                    }
-                }
-            }
-
-            Event::UserEvent(UserEvent::Navigated { tab_id, url }) => {
-                if url == "about:blank" {
-                    // WebView2 sometimes emits transient navigations; don't reflect them into UI.
-                    return;
-                }
-                if let Some(idx) = find_tab_idx(&tabs, tab_id) {
-                    tabs[idx].url = url;
-                    if idx == current {
-                        sync_toolbar(&toolbar, &tabs, current);
-                        focus_active_tab(&tabs, current);
-                    } else {
-                        #[cfg(target_os = "windows")]
-                        sync_toolbar(&toolbar, &tabs, current);
-                        #[cfg(not(target_os = "windows"))]
-                        {
-                            let titles = tabs.iter().map(tab_label).collect::<Vec<_>>();
-                            let script = format!(
-                                "window.__setTabTitle({}, {});",
-                                idx,
-                                json!(titles[idx])
-                            );
-                            let _ = toolbar.evaluate_script(&script);
-                        }
-                    }
-                }
-            }
-
-            Event::UserEvent(UserEvent::TitleChanged { tab_id, title }) => {
-                if let Some(idx) = find_tab_idx(&tabs, tab_id) {
-                    tabs[idx].title = title;
-                    #[cfg(target_os = "windows")]
-                    sync_toolbar(&toolbar, &tabs, current);
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        let titles = tabs.iter().map(tab_label).collect::<Vec<_>>();
-                        let script = format!(
-                            "window.__setTabTitle({}, {});",
-                            idx,
-                            json!(titles[idx])
-                        );
-                        let _ = toolbar.evaluate_script(&script);
-                    }
-                }
-            }
-
-            Event::UserEvent(UserEvent::NewWindow { url }) => {
-                if let Some(url) = resolve_omnibox_input(&url) {
-                    open_new_tab(
-                        &window,
-                        &proxy,
-                        &mut tabs,
-                        &mut current,
-                        &mut next_id,
-                        &toolbar,
-                        &url,
-                        ww,
-                        wh,
-                        devtools_open,
-                        #[cfg(target_os = "windows")]
-                        Some(&devtools_panel),
-                    );
-                }
-            }
-
-            Event::UserEvent(UserEvent::WakeIpc) => {}
-
-            Event::UserEvent(UserEvent::Ipc(msg)) => {
-                #[cfg(target_os = "windows")]
-                log_windows_ipc(&msg);
-                let mut ipc_ctx = IpcContext {
-                    control_flow,
-                    window: &window,
-                    toolbar: &toolbar,
-                    tabs: &mut tabs,
-                    current: &mut current,
-                    next_id: &mut next_id,
-                    proxy: &proxy,
-                    ww: &mut ww,
-                    wh: &mut wh,
-                    devtools_open: &mut devtools_open,
-                    #[cfg(target_os = "windows")]
-                    devtools_panel: Some(&devtools_panel),
-                };
-                process_ipc(&msg, &mut ipc_ctx);
-            },
-
-            #[cfg(target_os = "windows")]
-            Event::MainEventsCleared => {
-                if z_order_nudges < 60 {
-                    raise_toolbar(
-                        &toolbar,
-                        &window,
-                        Some(&tabs),
-                        Some(&devtools_panel),
-                    );
-                    z_order_nudges += 1;
-                }
-            }
-
-            _ => {}
-        }
+    #[cfg(not(target_os = "windows"))]
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+        dispatch_app_event(
+            event,
+            control_flow,
+            &window,
+            &toolbar,
+            None,
+            &mut tabs,
+            &mut current,
+            &mut next_id,
+            &proxy,
+            &mut ww,
+            &mut wh,
+            &mut devtools_open,
+            &mut modifiers,
+            None,
+        );
     });
 }
 
