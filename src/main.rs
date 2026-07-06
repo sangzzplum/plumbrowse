@@ -1240,6 +1240,9 @@ fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
     let html = toolbar_html();
     let proxy_page = proxy.clone();
+    let proxy_ipc = proxy.clone();
+    #[cfg(target_os = "windows")]
+    let proxy_nav = proxy.clone();
     let mut builder = WebViewBuilder::new()
         .with_bounds(bounds_toolbar(ww))
         .with_background_color(TOOLBAR_BG)
@@ -1257,12 +1260,11 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
             }
         })
         .with_ipc_handler(move |req: Request<String>| {
-            let _ = proxy.send_event(UserEvent::Ipc(req.body().clone()));
+            let _ = proxy_ipc.send_event(UserEvent::Ipc(req.body().clone()));
         });
 
     #[cfg(target_os = "windows")]
     {
-        let proxy_nav = proxy.clone();
         builder = builder
             .with_html(&html)
             .with_default_context_menus(false)
