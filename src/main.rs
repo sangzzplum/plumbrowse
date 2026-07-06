@@ -96,6 +96,18 @@ fn init_windows_debug_log() {
 }
 
 #[cfg(target_os = "windows")]
+fn install_windows_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        log_windows_debug(&format!("PANIC: {info}"));
+    }));
+}
+
+#[cfg(target_os = "windows")]
+fn win_startup(step: &str) {
+    log_windows_debug(&format!("startup: {step}"));
+}
+
+#[cfg(target_os = "windows")]
 fn log_windows_debug(msg: &str) {
     use std::io::Write;
     for path in debug_log_paths() {
@@ -1792,6 +1804,9 @@ static WIN_IPC_BUSY: AtomicBool = AtomicBool::new(false);
 static WIN_EXIT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
+static WIN_IPC_READY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "windows")]
 fn win_ipc_fallback() -> &'static Mutex<Vec<String>> {
     WIN_IPC_FALLBACK.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -1805,6 +1820,10 @@ unsafe fn win_app_mut<'a>(ptr: WinAppPtr) -> &'a mut WindowsRunState {
 fn register_win_app(ptr: WinAppPtr) {
     let _ = WIN_APP_PTR.set(ptr);
     log_windows_debug(&format!("win ipc host installed ptr={:p}", ptr.0));
+}
+
+#[cfg(target_os = "windows")]
+fn drain_win_ipc_fallback() {
     let pending = win_ipc_fallback()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1817,6 +1836,10 @@ fn register_win_app(ptr: WinAppPtr) {
 
 #[cfg(target_os = "windows")]
 fn dispatch_win_ipc(msg: &str) {
+    if msg == "ready" {
+        return;
+    }
+
     let Some(app_ptr) = WIN_APP_PTR.get() else {
         win_ipc_fallback()
             .lock()
@@ -1825,6 +1848,15 @@ fn dispatch_win_ipc(msg: &str) {
         log_windows_debug(&format!("ipc queued (host pending): {msg}"));
         return;
     };
+
+    if !WIN_IPC_READY.load(Ordering::SeqCst) {
+        win_ipc_fallback()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(msg.to_string());
+        log_windows_debug(&format!("ipc queued (not ready): {msg}"));
+        return;
+    }
 
     if WIN_IPC_BUSY.swap(true, Ordering::SeqCst) {
         win_ipc_fallback()
@@ -1870,12 +1902,6 @@ fn dispatch_win_ipc(msg: &str) {
         if let Some(proxy) = EVENT_PROXY.get() {
             let _ = proxy.send_event(UserEvent::WakeIpc);
         }
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(400));
-            if WIN_EXIT.load(Ordering::SeqCst) {
-                std::process::exit(0);
-            }
-        });
     }
 }
 
@@ -2351,7 +2377,7 @@ fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
 
     #[cfg(target_os = "windows")]
     {
-        builder = builder.with_decorations(false);
+        builder = builder.with_decorations(false).with_visible(false);
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -2395,6 +2421,9 @@ fn run_windows_app(
         );
         sync_toolbar(&app.toolbar, &app.tabs, app.current);
         log_windows_layout(&app.toolbar, &app.tabs, "startup");
+        WIN_IPC_READY.store(true, Ordering::SeqCst);
+        drain_win_ipc_fallback();
+        log_windows_debug("startup complete, entering event loop");
     }
 
     event_loop.run(move |event, _, control_flow| {
@@ -2430,22 +2459,29 @@ fn main() {
     init_windows_debug_log();
 
     #[cfg(target_os = "windows")]
+    install_windows_panic_hook();
+
+    #[cfg(target_os = "windows")]
+    win_startup("main begin");
+
+    #[cfg(target_os = "windows")]
     std::env::set_var(
         "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
         "--remote-debugging-port=9222 --remote-allow-origins=*",
     );
 
+    #[cfg(target_os = "windows")]
+    win_startup("creating event loop");
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
     #[cfg(target_os = "windows")]
     let _ = EVENT_PROXY.set(proxy.clone());
 
+    #[cfg(target_os = "windows")]
+    win_startup("building window");
     let window = build_window(&event_loop);
     set_dock_icon();
-
-    #[cfg(target_os = "windows")]
-    window.set_visible(false);
 
     #[cfg_attr(target_os = "windows", allow(unused_mut))]
     let (mut ww, mut wh) = logical_size(&window);
@@ -2456,12 +2492,18 @@ fn main() {
     #[cfg_attr(target_os = "windows", allow(unused_mut))]
     let mut modifiers = ModifiersState::empty();
 
+    #[cfg(target_os = "windows")]
+    win_startup("building toolbar");
     // Windows: toolbar must be created before content webviews or HTML often stays blank (white bar).
     let toolbar = build_toolbar(&window, proxy.clone(), ww);
 
     #[cfg(target_os = "windows")]
+    win_startup("building devtools panel");
+    #[cfg(target_os = "windows")]
     let devtools_panel = build_devtools_panel(&window, ww, wh);
 
+    #[cfg(target_os = "windows")]
+    win_startup("building content webview");
     let first_webview = build_content_webview(
         &window,
         proxy.clone(),
@@ -2484,6 +2526,8 @@ fn main() {
     #[cfg_attr(target_os = "windows", allow(unused_mut))]
     let mut current: usize = 0;
 
+    #[cfg(target_os = "windows")]
+    win_startup("entering run_windows_app");
     #[cfg(target_os = "windows")]
     {
         run_windows_app(
