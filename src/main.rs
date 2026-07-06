@@ -1331,7 +1331,8 @@ mod win_devtools {
         GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, MoveWindow, PostMessageW,
         SetParent, ShowWindow, GWL_STYLE, SW_SHOW, WM_CLOSE, WS_CHILD, WS_POPUP,
     };
-    use wry::dpi::{PhysicalPosition, PhysicalSize, Rect};
+    use wry::dpi::{PhysicalPosition, PhysicalSize};
+    use wry::Rect;
 
     static EMBEDDED_HWND: AtomicIsize = AtomicIsize::new(0);
     static PANEL_HOST_HWND: AtomicIsize = AtomicIsize::new(0);
