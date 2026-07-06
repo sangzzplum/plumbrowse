@@ -339,7 +339,14 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
     let host = uri.host().unwrap_or_default();
     let path = uri.path();
 
-    if host == "toolbar" || path.starts_with("/toolbar") {
+    // WebView2 can pass custom-scheme URLs with empty host where the authority
+    // ends up inside the path (e.g. `plum://toolbar/` -> path `/toolbar/`).
+    let full = uri.to_string();
+    if host == "toolbar"
+        || full.starts_with("plum://toolbar")
+        || path == "/toolbar"
+        || path.starts_with("/toolbar/")
+    {
         let html = toolbar_html();
         return Response::builder()
             .status(200)
@@ -418,7 +425,10 @@ const TOOLBAR_SCRIPT: &str = r#"
       if (max) max.addEventListener('click', () => post('win_max_toggle'));
       if (close) close.addEventListener('click', () => post('win_close'));
 
-      document.getElementById('addtab').addEventListener('click', () => post('new_tab:'));
+      const addInline = document.getElementById('addtab-inline');
+      if (addInline) addInline.addEventListener('click', () => post('new_tab:'));
+      const addFixed = document.getElementById('addtab-fixed');
+      if (addFixed) addFixed.addEventListener('click', () => post('new_tab:'));
 
       const strip = document.getElementById('tab-strip');
       if (strip) {
@@ -449,7 +459,7 @@ const TOOLBAR_SCRIPT: &str = r#"
       post('ready');
     });
 
-    const TAB_MIN = 48;
+    const TAB_MIN = 32;
     const TAB_MAX = 220;
     const TAB_GAP = 8;
 
@@ -476,6 +486,10 @@ const TOOLBAR_SCRIPT: &str = r#"
           });
           const active = strip.querySelector('.tab.active');
           if (active) active.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+          const addInline = document.getElementById('addtab-inline');
+          const addFixed = document.getElementById('addtab-fixed');
+          if (addInline) addInline.style.display = 'none';
+          if (addFixed) addFixed.style.display = 'grid';
           return;
         }
 
@@ -487,6 +501,11 @@ const TOOLBAR_SCRIPT: &str = r#"
           t.style.minWidth = TAB_MIN + 'px';
           t.style.maxWidth = TAB_MAX + 'px';
         });
+
+        const addInline = document.getElementById('addtab-inline');
+        const addFixed = document.getElementById('addtab-fixed');
+        if (addInline) addInline.style.display = 'grid';
+        if (addFixed) addFixed.style.display = 'none';
       });
     }
 
@@ -501,6 +520,15 @@ const TOOLBAR_SCRIPT: &str = r#"
         t.className = 'tab' + (i === current ? ' active' : '');
         t.onclick = () => post('switch_tab:' + i);
 
+        const icon = document.createElement('div');
+        icon.className = 'tab-icon';
+        icon.innerHTML =
+          '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" xmlns="http://www.w3.org/2000/svg">' +
+          '<path d="M12 2.6c5.19 0 9.4 4.21 9.4 9.4 0 5.19-4.21 9.4-9.4 9.4-5.19 0-9.4-4.21-9.4-9.4 0-5.19 4.21-9.4 9.4-9.4Z" stroke="rgba(232,234,237,0.85)" stroke-width="1.6"/>' +
+          '<path d="M2.8 12h18.4" stroke="rgba(154,160,166,0.85)" stroke-width="1.2"/>' +
+          '<path d="M12 2.8c2.6 2.6 4.1 6 4.1 9.2s-1.5 6.6-4.1 9.2c-2.6-2.6-4.1-6-4.1-9.2S9.4 5.4 12 2.8Z" stroke="rgba(154,160,166,0.85)" stroke-width="1.2"/>' +
+          '</svg>';
+
         const tt = document.createElement('div');
         tt.className = 'tab-title';
         tt.textContent = title;
@@ -510,6 +538,7 @@ const TOOLBAR_SCRIPT: &str = r#"
         x.textContent = '×';
         x.onclick = (e) => { e.stopPropagation(); post('close_tab:' + i); };
 
+        t.appendChild(icon);
         t.appendChild(tt);
         t.appendChild(x);
         strip.appendChild(t);
@@ -537,6 +566,7 @@ const TAB_BAR_CSS: &str = r#"
       display:flex; gap:8px; align-items:center;
       flex:1 1 0%; min-width:0; width:0;
       overflow-x:auto; overflow-y:hidden;
+      scrollbar-gutter: stable both-edges;
       scrollbar-width:thin; scrollbar-color:#5f6368 transparent;
     }
     .tab-strip::-webkit-scrollbar { height:6px; }
@@ -549,21 +579,30 @@ const TAB_BAR_CSS: &str = r#"
     }
     .addtab:hover { background:var(--b2); }
     .tab {
+      position:relative;
       display:flex; align-items:center; gap:6px;
-      height:32px; padding:0 8px; border-radius:12px; background:var(--b);
+      height:32px; padding:0 28px 0 8px; border-radius:12px; background:var(--b);
       cursor:pointer; user-select:none; box-sizing:border-box;
     }
     .tab.active { background:var(--b2); }
+    .tab-icon { flex:0 0 auto; width:16px; height:16px; opacity:0.95; display:grid; place-items:center; }
     .tab-title {
       min-width:0; overflow:hidden; white-space:nowrap;
       text-overflow:ellipsis; flex:1 1 auto;
     }
     .tab-close {
-      flex:0 0 auto; width:24px; height:24px; border-radius:10px;
+      position:absolute; right:6px; top:4px;
+      width:24px; height:24px; border-radius:10px;
       display:grid; place-items:center; color:var(--mut); font-weight:900;
+      opacity:0; pointer-events:none;
     }
+    .tab:hover .tab-close { opacity:1; pointer-events:auto; }
     .tab-close:hover { background:#2a2b2f; color:var(--fg); }
     .tab-strip.scroll .tab-title { display:none; }
+    .tab-strip.scroll .tab { padding:0; width:32px; border-radius:10px; display:grid; place-items:center; }
+    .tab-strip.scroll .tab-icon { width:16px; height:16px; }
+    .tab-strip.scroll .tab:hover .tab-icon { opacity:0; }
+    .tab-strip.scroll .tab:hover .tab-close { opacity:1; pointer-events:auto; }
 "#;
 
 fn toolbar_html() -> String {
@@ -612,7 +651,8 @@ fn toolbar_html() -> String {
     <div class="tabs-wrap">
       <div class="tabs-bar">
         <div class="tab-strip" id="tab-strip"></div>
-        <div class="addtab" id="addtab" title="Новая вкладка">+</div>
+        <div class="addtab" id="addtab-inline" title="Новая вкладка">+</div>
+        <div class="addtab" id="addtab-fixed" title="Новая вкладка" style="display:none">+</div>
       </div>
     </div>
     <div class="nav-row">
@@ -688,7 +728,8 @@ fn toolbar_html() -> String {
     <div class="toolbar">
       <div class="tabs-bar">
         <div class="tab-strip" id="tab-strip"></div>
-        <div class="addtab" id="addtab" title="Новая вкладка">+</div>
+        <div class="addtab" id="addtab-inline" title="Новая вкладка">+</div>
+        <div class="addtab" id="addtab-fixed" title="Новая вкладка" style="display:none">+</div>
       </div>
       <div class="row">
         <div class="navbtn" id="back" title="Назад">←</div>
