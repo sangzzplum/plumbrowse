@@ -1,6 +1,7 @@
 //! PlumBrowser — лёгкий кросс-платформенный браузер на Rust.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+#[cfg(not(target_os = "windows"))]
 use serde_json::json;
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -1816,7 +1817,7 @@ fn register_win_app(ptr: WinAppPtr) {
 
 #[cfg(target_os = "windows")]
 fn dispatch_win_ipc(msg: &str) {
-    let Some(WinAppPtr(ptr)) = WIN_APP_PTR.get() else {
+    let Some(app_ptr) = WIN_APP_PTR.get() else {
         win_ipc_fallback()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1837,7 +1838,7 @@ fn dispatch_win_ipc(msg: &str) {
     log_windows_debug(&format!("handled ipc: {msg}"));
     let mut flow = ControlFlow::Wait;
     unsafe {
-        let app = win_app_mut(*ptr);
+        let app = win_app_mut(*app_ptr);
         let mut ctx = IpcContext {
             control_flow: &mut flow,
             window: &app.window,
@@ -2446,10 +2447,13 @@ fn main() {
     #[cfg(target_os = "windows")]
     window.set_visible(false);
 
+    #[cfg_attr(target_os = "windows", allow(unused_mut))]
     let (mut ww, mut wh) = logical_size(&window);
 
     let mut next_id: u32 = 1;
+    #[cfg_attr(target_os = "windows", allow(unused_mut))]
     let mut devtools_open = false;
+    #[cfg_attr(target_os = "windows", allow(unused_mut))]
     let mut modifiers = ModifiersState::empty();
 
     // Windows: toolbar must be created before content webviews or HTML often stays blank (white bar).
@@ -2470,12 +2474,14 @@ fn main() {
     );
     next_id += 1;
 
+    #[cfg_attr(target_os = "windows", allow(unused_mut))]
     let mut tabs = vec![Tab {
         id: 1,
         url: NEWTAB_URL.to_string(),
         title: "Новая вкладка".to_string(),
         webview: first_webview,
     }];
+    #[cfg_attr(target_os = "windows", allow(unused_mut))]
     let mut current: usize = 0;
 
     #[cfg(target_os = "windows")]
