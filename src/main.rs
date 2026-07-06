@@ -179,8 +179,7 @@ fn toolbar_navigation_allowed(url: &str) -> bool {
     !url.starts_with("http://") && !url.starts_with("https://") && !url.starts_with("file://")
 }
 
-#[cfg(target_os = "windows")]
-const TOOLBAR_PROTOCOL_URL: &str = "plum://toolbar/";
+// (was used when toolbar was loaded via `plum://toolbar/` on Windows)
 
 /// Toolbar — это UI, не сайт.
 const TOOLBAR_LOCK_SCRIPT: &str = r#"
@@ -290,7 +289,10 @@ fn resolve_omnibox_input(input: &str) -> Option<String> {
 
     // If it contains whitespace, it's a search query.
     if u.chars().any(char::is_whitespace) {
-        return Some(format!("https://duckduckgo.com/?q={}", percent_encode_query(u)));
+        return Some(format!(
+            "https://www.google.com/search?q={}",
+            percent_encode_query(u)
+        ));
     }
 
     // Heuristic: looks like a host if it contains a dot.
@@ -301,7 +303,7 @@ fn resolve_omnibox_input(input: &str) -> Option<String> {
 
     // Otherwise search.
     Some(format!(
-        "https://duckduckgo.com/?q={}",
+        "https://www.google.com/search?q={}",
         percent_encode_query(u)
     ))
 }
@@ -372,6 +374,27 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
     // WebView2 can pass custom-scheme URLs with empty host where the authority
     // ends up inside the path (e.g. `plum://toolbar/` -> path `/toolbar/`).
     let full = uri.to_string();
+    // Windows toolbar bootstrap assets
+    #[cfg(target_os = "windows")]
+    {
+        if full.contains("/toolbar/app.css") {
+            let css = toolbar_css_windows();
+            return Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, "text/css; charset=utf-8")
+                .body(Cow::Owned(css.into_bytes()))
+                .unwrap();
+        }
+        if full.contains("/toolbar/app.js") {
+            let js = toolbar_js_windows();
+            return Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, "text/javascript; charset=utf-8")
+                .body(Cow::Owned(js.into_bytes()))
+                .unwrap();
+        }
+    }
+
     let is_toolbar = host == "toolbar"
         || full.starts_with("plum://toolbar")
         || path == "/toolbar"
@@ -404,6 +427,123 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
         .header(CONTENT_TYPE, mime)
         .body(body)
         .unwrap()
+}
+
+// Small bootstrap HTML for Windows toolbar.
+// WebView2 has practical limits for very large data-HTML documents; we keep the
+// top-level HTML tiny and load the heavy CSS/JS via our custom protocol.
+#[cfg(target_os = "windows")]
+fn toolbar_bootstrap_html_windows() -> String {
+    let toolbar_h = toolbar_height() as i32;
+    format!(
+        r#"<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#202124; }}
+    body {{ background:#202124; }}
+  </style>
+  <link rel="stylesheet" href="plum://toolbar/app.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <script>window.__TOOLBAR_H__ = {toolbar_h};</script>
+  <script src="plum://toolbar/app.js"></script>
+</body>
+</html>"#
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn toolbar_css_windows() -> String {
+    let toolbar_h = toolbar_height() as i32;
+    let tab_bar_css = TAB_BAR_CSS;
+    format!(
+        r#"
+:root {{
+  --bg:#202124; --fg:#e8eaed; --mut:#9aa0a6; --b:#303134; --b2:#3c4043; --danger:#5b2b2b;
+  --toolbarH:{toolbar_h}px; --titlebarH:44px;
+}}
+* {{ box-sizing:border-box; }}
+html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:var(--bg); }}
+body {{ background:var(--bg); color:var(--fg); font:14px/1.2 system-ui,"Segoe UI",Arial; }}
+.chrome {{ height:var(--toolbarH); display:flex; flex-direction:column; }}
+.titlebar {{
+  height:var(--titlebarH); display:flex; align-items:center; gap:10px;
+  padding:0 12px; border-bottom:1px solid #2b2c2f;
+  user-select:none; -webkit-user-select:none;
+}}
+.drag {{ flex:1; height:100%; display:flex; align-items:center; color:var(--mut); font-weight:700; -webkit-app-region:drag; }}
+.winbtns {{ display:flex; gap:8px; -webkit-app-region:no-drag; }}
+.wbtn {{ width:40px; height:26px; border-radius:10px; background:var(--b); display:grid; place-items:center; cursor:pointer; }}
+.wbtn:hover {{ background:var(--b2); }}
+.wbtn.close {{ background:var(--danger); }}
+.toolbar {{ flex:1; display:flex; flex-direction:column; gap:8px; padding:8px 12px 10px; -webkit-app-region:no-drag; }}
+{tab_bar_css}
+.addtab, .tab, .navbtn, input, .go {{ -webkit-app-region:no-drag; }}
+.row {{ display:flex; gap:8px; align-items:center; }}
+.navbtn {{
+  width:36px; height:36px; border-radius:12px; background:var(--b);
+  display:grid; place-items:center; cursor:pointer; user-select:none;
+  font-size:16px; flex:0 0 auto;
+}}
+.navbtn:hover {{ background:var(--b2); }}
+input {{
+  flex:1; min-width:200px; padding:10px 14px; border-radius:16px;
+  border:1px solid #3c4043; outline:none; background:#111; color:var(--fg);
+}}
+.go {{ padding:10px 14px; border-radius:16px; background:var(--b); cursor:pointer; user-select:none; flex:0 0 auto; }}
+.go:hover {{ background:var(--b2); }}
+"#
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn toolbar_js_windows() -> String {
+    let script = TOOLBAR_SCRIPT;
+    format!(
+        r#"
+(function() {{
+  const root = document.getElementById('root');
+  if (!root) return;
+  root.innerHTML = `
+    <div class="chrome">
+      <div class="titlebar">
+        <div class="drag" id="drag">PlumBrowser</div>
+        <div class="winbtns">
+          <div class="wbtn" id="min" title="Свернуть">—</div>
+          <div class="wbtn" id="max" title="Развернуть">□</div>
+          <div class="wbtn close" id="close" title="Закрыть">×</div>
+        </div>
+      </div>
+      <div class="toolbar">
+        <div class="tabs-bar">
+          <div class="tab-strip" id="tab-strip"></div>
+          <div class="addtab" id="addtab-inline" title="Новая вкладка">+</div>
+          <div class="addtab" id="addtab-fixed" title="Новая вкладка" style="display:none">+</div>
+        </div>
+        <div class="row">
+          <div class="navbtn" id="back" title="Назад">←</div>
+          <div class="navbtn" id="forward" title="Вперёд">→</div>
+          <div class="navbtn" id="reload" title="Обновить">↻</div>
+          <div class="navbtn" id="devtools" title="Инструменты разработчика (F12)">{ }</div>
+          <input id="url" placeholder="адрес или поиск" autocomplete="off" spellcheck="false" />
+          <div class="go" id="go">Go</div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // Inject the main toolbar logic script (same as mac).
+  const s = document.createElement('script');
+  s.textContent = {script_json};
+  document.body.appendChild(s);
+}})();
+"#,
+        script_json = serde_json::to_string(script).unwrap()
+    )
 }
 
 const NEWTAB_HTML: &str = r#"<!doctype html>
@@ -467,7 +607,7 @@ const TOOLBAR_SCRIPT: &str = r#"
       if (e.detail > 1 && !e.target.closest('input')) e.preventDefault();
     });
 
-    window.addEventListener('DOMContentLoaded', () => {
+    function initToolbar() {
       const drag = document.getElementById('drag');
       if (drag) drag.addEventListener('pointerdown', () => post('win_drag'));
 
@@ -510,7 +650,15 @@ const TOOLBAR_SCRIPT: &str = r#"
       urlInput.addEventListener('blur', () => post('focus_content'));
 
       post('ready');
-    });
+    }
+
+    // Expose for Windows bootstrap loader.
+    window.__toolbarInit = initToolbar;
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initToolbar);
+    } else {
+      initToolbar();
+    }
 
     const TAB_MIN = 32;
     const TAB_MAX = 220;
@@ -1007,7 +1155,8 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
     #[cfg(target_os = "windows")]
     {
         builder = builder
-            .with_html(toolbar_html())
+            .with_html(toolbar_bootstrap_html_windows())
+            .with_custom_protocol("plum".to_string(), plum_protocol)
             .with_default_context_menus(false)
             .with_browser_accelerator_keys(false);
     }
