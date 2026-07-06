@@ -46,7 +46,7 @@ fn toolbar_height() -> f64 {
 }
 
 #[cfg(target_os = "windows")]
-fn log_windows_ipc(msg: &str) {
+fn log_windows_debug(msg: &str) {
     use std::io::Write;
     let path = std::env::temp_dir().join("plumbrowser_debug.log");
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -54,8 +54,13 @@ fn log_windows_ipc(msg: &str) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(file, "ipc: {msg}");
+        let _ = writeln!(file, "{msg}");
     }
+}
+
+#[cfg(target_os = "windows")]
+fn log_windows_ipc(msg: &str) {
+    log_windows_debug(&format!("ipc: {msg}"));
 }
 
 #[cfg(target_os = "windows")]
@@ -169,6 +174,56 @@ fn sync_windows_z_order(
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
             );
             let _ = BringWindowToTop(host);
+        }
+    }
+}
+
+/// Content HWND sometimes spans the full window while only painting below the toolbar.
+/// Clip hit-testing so clicks in the toolbar band reach the toolbar webview.
+#[cfg(target_os = "windows")]
+fn enforce_content_clipping(webview: &WebView, window: &Window) {
+    use tao::platform::windows::WindowExtWindows;
+    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::Graphics::Gdi::{CreateRectRgn, SetWindowRgn};
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, MapWindowPoints};
+
+    let Some(host) = webview_host_hwnd(webview) else {
+        return;
+    };
+    let scale = window.scale_factor();
+    let toolbar_phys = (toolbar_height() * scale).round() as i32;
+    let parent = HWND(window.hwnd() as _);
+
+    let mut host_rect = RECT::default();
+    if unsafe { GetWindowRect(host, &mut host_rect) }.is_err() {
+        return;
+    }
+
+    let mut top_left = POINT {
+        x: host_rect.left,
+        y: host_rect.top,
+    };
+    if unsafe { MapWindowPoints(None, Some(parent), std::slice::from_mut(&mut top_left)) }.is_err() {
+        return;
+    }
+
+    if top_left.y >= toolbar_phys {
+        unsafe {
+            let _ = SetWindowRgn(host, None, true);
+        }
+        return;
+    }
+
+    let client_w = host_rect.right - host_rect.left;
+    let client_h = host_rect.bottom - host_rect.top;
+    let clip_top = (toolbar_phys - top_left.y).clamp(0, client_h);
+    if clip_top >= client_h {
+        return;
+    }
+
+    unsafe {
+        if let Ok(rgn) = CreateRectRgn(0, clip_top, client_w, client_h) {
+            let _ = SetWindowRgn(host, rgn, true);
         }
     }
 }
@@ -579,6 +634,12 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
         current = current,
         cur_url = json!(cur_url)
     );
+    #[cfg(target_os = "windows")]
+    match toolbar.evaluate_script(&script) {
+        Ok(()) => log_windows_debug("sync_toolbar ok"),
+        Err(err) => log_windows_debug(&format!("sync_toolbar failed: {err}")),
+    }
+    #[cfg(not(target_os = "windows"))]
     let _ = toolbar.evaluate_script(&script);
 }
 
@@ -656,19 +717,16 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
 
 const TOOLBAR_SCRIPT: &str = r#"
     function post(msg) {
+      // Navigation IPC is reliable on WebView2 toolbars; postMessage often exists but is a no-op.
+      try {
+        window.location.replace('plum://ipc/' + encodeURIComponent(msg));
+      } catch (e) {}
       try {
         if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
           window.chrome.webview.postMessage(msg);
-          return;
-        }
-        if (window.ipc && window.ipc.postMessage) {
+        } else if (window.ipc && window.ipc.postMessage) {
           window.ipc.postMessage(msg);
-          return;
         }
-      } catch (e) {}
-      // WebView2 + custom scheme (plum://toolbar): postMessage often missing — use navigation IPC.
-      try {
-        window.location.replace('plum://ipc/' + encodeURIComponent(msg));
       } catch (e2) {}
     }
 
@@ -742,8 +800,15 @@ const TOOLBAR_SCRIPT: &str = r#"
         });
         urlInput.addEventListener('blur', () => post('focus_content'));
       }
+    }
 
-      post('ready');
+    function bootToolbar() {
+      initToolbar();
+      if (window.__pendingState && typeof window.__setState === 'function') {
+        const pending = window.__pendingState;
+        window.__setState(pending[0], pending[1], pending[2], pending[3]);
+        delete window.__pendingState;
+      }
     }
 
     const TAB_MIN = 32;
@@ -852,15 +917,9 @@ const TOOLBAR_SCRIPT: &str = r#"
     };
 
     if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', initToolbar);
+      document.addEventListener('DOMContentLoaded', bootToolbar);
     } else {
-      initToolbar();
-    }
-
-    if (window.__pendingState && typeof window.__setState === 'function') {
-      const pending = window.__pendingState;
-      window.__setState(pending[0], pending[1], pending[2], pending[3]);
-      delete window.__pendingState;
+      queueMicrotask(bootToolbar);
     }
 "#;
 
@@ -1205,6 +1264,10 @@ fn resize_all(
         let _ = tab.webview.set_bounds(bounds);
     }
     #[cfg(target_os = "windows")]
+    for tab in tabs {
+        enforce_content_clipping(&tab.webview, window);
+    }
+    #[cfg(target_os = "windows")]
     if let Some(panel) = devtools_panel {
         let _ = panel.set_bounds(bounds_devtools_panel(ww, wh));
         let _ = panel.set_visible(devtools_open);
@@ -1284,7 +1347,7 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
     let proxy_page = proxy.clone();
     let proxy_ipc = proxy.clone();
     let proxy_nav = proxy.clone();
-    let mut builder = WebViewBuilder::new()
+    let builder = WebViewBuilder::new()
         .with_bounds(bounds_toolbar(ww))
         .with_background_color(TOOLBAR_BG)
         .with_visible(true)
@@ -1311,18 +1374,10 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
             let _ = proxy_ipc.send_event(UserEvent::Ipc(req.body().clone()));
         });
 
-    #[cfg(target_os = "windows")]
-    {
-        const TOOLBAR_URL: &str = "plum://toolbar/";
-        builder = builder
-            .with_url(TOOLBAR_URL)
-            .with_custom_protocol("plum".to_string(), plum_protocol);
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let html = toolbar_html();
-        builder = builder.with_html(&html);
-    }
+    let html = toolbar_html();
+    let builder = builder
+        .with_html(&html)
+        .with_custom_protocol("plum".to_string(), plum_protocol);
 
     #[cfg(target_os = "windows")]
     let builder = builder
@@ -1883,13 +1938,16 @@ fn main() {
 
             #[cfg(target_os = "windows")]
             Event::MainEventsCleared => {
-                if z_order_nudges < 20 {
+                if z_order_nudges < 60 {
                     raise_toolbar(
                         &toolbar,
                         &window,
                         Some(&tabs),
                         Some(&devtools_panel),
                     );
+                    if z_order_nudges % 5 == 0 {
+                        sync_toolbar(&toolbar, &tabs, current);
+                    }
                     z_order_nudges += 1;
                 }
             }
