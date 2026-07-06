@@ -6,7 +6,10 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    mpsc::{self, Receiver, Sender},
+    Mutex, OnceLock,
+};
 use tao::{
     dpi::PhysicalSize,
     event::{ElementState, Event, WindowEvent},
@@ -478,6 +481,8 @@ struct Tab {
 #[derive(Debug, Clone)]
 enum UserEvent {
     Ipc(String),
+    /// Windows: wake tao loop after cross-thread toolbar IPC enqueue.
+    WakeIpc,
     ToggleDevtools,
     Navigated { tab_id: u32, url: String },
     TitleChanged { tab_id: u32, title: String },
@@ -1749,25 +1754,22 @@ fn open_new_tab(
 }
 
 #[cfg(target_os = "windows")]
-static IPC_INBOX: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static IPC_SENDER: OnceLock<Sender<String>> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
 fn enqueue_ipc(msg: String) {
-    IPC_INBOX
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(msg);
-}
-
-#[cfg(target_os = "windows")]
-fn drain_ipc_inbox() -> Vec<String> {
-    IPC_INBOX
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .drain(..)
-        .collect()
+    let Some(tx) = IPC_SENDER.get() else {
+        log_windows_debug("ipc sender missing");
+        return;
+    };
+    match tx.send(msg) {
+        Ok(()) => {
+            if let Some(proxy) = EVENT_PROXY.get() {
+                let _ = proxy.send_event(UserEvent::WakeIpc);
+            }
+        }
+        Err(e) => log_windows_debug(&format!("ipc enqueue failed: {e}")),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1981,6 +1983,7 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
 #[cfg(target_os = "windows")]
 #[allow(clippy::too_many_arguments)]
 fn drain_and_process_ipc(
+    ipc_rx: &Receiver<String>,
     control_flow: &mut ControlFlow,
     window: &Window,
     toolbar: &WebView,
@@ -1993,7 +1996,7 @@ fn drain_and_process_ipc(
     devtools_open: &mut bool,
     devtools_panel: &WebView,
 ) {
-    for msg in drain_ipc_inbox() {
+    while let Ok(msg) = ipc_rx.try_recv() {
         log_windows_debug(&format!("handled ipc: {msg}"));
         let mut ipc_ctx = IpcContext {
             control_flow,
@@ -2058,6 +2061,10 @@ fn main() {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
+    #[cfg(target_os = "windows")]
+    let (ipc_tx, ipc_rx) = mpsc::channel::<String>();
+    #[cfg(target_os = "windows")]
+    let _ = IPC_SENDER.set(ipc_tx);
     #[cfg(target_os = "windows")]
     let _ = EVENT_PROXY.set(proxy.clone());
 
@@ -2127,6 +2134,7 @@ fn main() {
         #[cfg(target_os = "windows")]
         {
             drain_and_process_ipc(
+                &ipc_rx,
                 control_flow,
                 &window,
                 &toolbar,
@@ -2140,7 +2148,7 @@ fn main() {
                 &devtools_panel,
             );
             *control_flow =
-                ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(8));
+                ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -2332,6 +2340,8 @@ fn main() {
                 }
             }
 
+            Event::UserEvent(UserEvent::WakeIpc) => {}
+
             Event::UserEvent(UserEvent::Ipc(msg)) => {
                 #[cfg(target_os = "windows")]
                 log_windows_ipc(&msg);
@@ -2354,6 +2364,20 @@ fn main() {
 
             #[cfg(target_os = "windows")]
             Event::MainEventsCleared => {
+                drain_and_process_ipc(
+                    &ipc_rx,
+                    control_flow,
+                    &window,
+                    &toolbar,
+                    &mut tabs,
+                    &mut current,
+                    &mut next_id,
+                    &proxy,
+                    &mut ww,
+                    &mut wh,
+                    &mut devtools_open,
+                    &devtools_panel,
+                );
                 if z_order_nudges < 60 {
                     raise_toolbar(
                         &toolbar,
