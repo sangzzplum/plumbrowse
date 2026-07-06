@@ -4,6 +4,8 @@
 use serde_json::json;
 use std::borrow::Cow;
 use std::path::PathBuf;
+#[cfg(target_os = "windows")]
+use std::sync::{Mutex, OnceLock};
 use tao::{
     dpi::PhysicalSize,
     event::{ElementState, Event, WindowEvent},
@@ -476,6 +478,42 @@ enum UserEvent {
     FocusTab { tab_id: u32 },
 }
 
+/// Windows toolbar is re-rendered from Rust (WebView2 often won't run toolbar JS / evaluate_script).
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+struct ToolbarSnapshot {
+    titles: Vec<String>,
+    urls: Vec<String>,
+    current: usize,
+    cur_url: String,
+}
+
+#[cfg(target_os = "windows")]
+impl ToolbarSnapshot {
+    fn new_default() -> Self {
+        Self {
+            titles: vec!["Новая вкладка".to_string()],
+            urls: vec![NEWTAB_URL.to_string()],
+            current: 0,
+            cur_url: NEWTAB_URL.to_string(),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+static TOOLBAR_SNAPSHOT: OnceLock<Mutex<ToolbarSnapshot>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static EVENT_PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+fn toolbar_snapshot() -> &'static Mutex<ToolbarSnapshot> {
+    TOOLBAR_SNAPSHOT.get_or_init(|| Mutex::new(ToolbarSnapshot::new_default()))
+}
+
+const IPC_ACK_HTML: &str =
+    "<!doctype html><html><head><meta charset=\"utf-8\"></head><body></body></html>";
+
 fn percent_encode_query(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for &b in s.as_bytes() {
@@ -488,6 +526,31 @@ fn percent_encode_query(s: &str) -> String {
         }
     }
     out
+}
+
+fn percent_encode_ipc_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+#[cfg(target_os = "windows")]
+fn ipc_nav_url(msg: &str) -> String {
+    format!("plum://ipc/{}", percent_encode_ipc_path(msg))
 }
 
 fn percent_decode_component(s: &str) -> String {
@@ -604,8 +667,28 @@ fn tab_label(tab: &Tab) -> String {
 }
 
 fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
-    let titles = tabs.iter().map(tab_label).collect::<Vec<_>>();
-    let urls = tabs.iter().map(|t| t.url.clone()).collect::<Vec<_>>();
+    let titles: Vec<String> = tabs.iter().map(tab_label).collect();
+    let urls: Vec<String> = tabs.iter().map(|t| t.url.clone()).collect();
+    let cur_url = tabs
+        .get(current)
+        .map(|t| t.url.clone())
+        .unwrap_or_default();
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(mut snap) = toolbar_snapshot().lock() {
+            snap.titles = titles;
+            snap.urls = urls;
+            snap.current = current;
+            snap.cur_url = cur_url;
+        }
+        match toolbar.load_url("plum://toolbar/") {
+            Ok(()) => log_windows_debug("sync_toolbar reload ok"),
+            Err(err) => log_windows_debug(&format!("sync_toolbar reload failed: {err}")),
+        }
+        return;
+    }
+
     let cur_url = tabs.get(current).map(|t| t.url.as_str()).unwrap_or("");
 
     let script = format!(
@@ -650,6 +733,18 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
     let path = uri.path();
     let full = uri.to_string();
 
+    if let Some(msg) = toolbar_ipc_from_url(&full) {
+        #[cfg(target_os = "windows")]
+        if let Some(proxy) = EVENT_PROXY.get() {
+            let _ = proxy.send_event(UserEvent::Ipc(msg));
+        }
+        return Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Cow::Borrowed(IPC_ACK_HTML.as_bytes()))
+            .unwrap();
+    }
+
     // WebView2 can pass custom-scheme URLs with empty host where the authority
     // ends up inside the path (e.g. `plum://toolbar/` -> path `/toolbar/`).
     let is_toolbar = host == "toolbar"
@@ -661,6 +756,12 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
         || (host.is_empty() && path.contains("toolbar"));
 
     if is_toolbar {
+        #[cfg(target_os = "windows")]
+        let html = toolbar_snapshot()
+            .lock()
+            .map(|snap| windows_toolbar_html(&snap))
+            .unwrap_or_else(|e| windows_toolbar_html(&e.into_inner()));
+        #[cfg(not(target_os = "windows"))]
         let html = toolbar_html();
         return Response::builder()
             .status(200)
@@ -991,6 +1092,118 @@ const WINDOWS_TAB_BAR_CSS: &str = r#"
     #addtab-fixed { grid-column:2; }
     .toolbar { position:relative; }
 "#;
+
+/// Server-rendered toolbar for Windows — tabs and buttons use inline navigation IPC (no JS required).
+#[cfg(target_os = "windows")]
+fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
+    let toolbar_h = toolbar_height() as i32;
+    let version = version_label();
+    let cur_url_attr = html_escape(&snap.cur_url);
+
+    let mut tabs_html = String::new();
+    for (i, title) in snap.titles.iter().enumerate() {
+        let active = if i == snap.current { " active" } else { "" };
+        let title_esc = html_escape(title);
+        let switch = ipc_nav_url(&format!("switch_tab:{i}"));
+        let close = ipc_nav_url(&format!("close_tab:{i}"));
+        tabs_html.push_str(&format!(
+            r#"<div class="tab{active}" onclick="window.location.replace('{switch}')">"#
+        ));
+        tabs_html.push_str(&format!(
+            r#"<div class="tab-title">{title_esc}</div>"#
+        ));
+        tabs_html.push_str(&format!(
+            r#"<div class="tab-close" onclick="event.stopPropagation();window.location.replace('{close}')">×</div></div>"#
+        ));
+    }
+
+    let new_tab = ipc_nav_url("new_tab:");
+    let win_drag = ipc_nav_url("win_drag");
+    let win_min = ipc_nav_url("win_min");
+    let win_max = ipc_nav_url("win_max_toggle");
+    let win_close = ipc_nav_url("win_close");
+    let nav_back = ipc_nav_url("nav_back");
+    let nav_forward = ipc_nav_url("nav_forward");
+    let nav_reload = ipc_nav_url("nav_reload");
+    let nav_devtools = ipc_nav_url("nav_devtools");
+
+    format!(
+        r#"<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root {{
+      --bg:#202124; --fg:#e8eaed; --mut:#9aa0a6; --b:#303134; --b2:#3c4043; --danger:#5b2b2b;
+      --toolbarH:{toolbar_h}px; --titlebarH:44px;
+    }}
+    * {{ box-sizing:border-box; }}
+    html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#202124; }}
+    body {{ background:var(--bg); color:var(--fg); font:14px/1.2 system-ui,"Segoe UI",Arial; }}
+    .chrome {{ height:var(--toolbarH); display:flex; flex-direction:column; }}
+    .titlebar {{
+      height:var(--titlebarH); display:flex; align-items:center; gap:10px;
+      padding:0 12px; border-bottom:1px solid #2b2c2f;
+      user-select:none; -webkit-user-select:none;
+    }}
+    .drag {{ flex:1; height:100%; display:flex; align-items:center; color:var(--mut); font-weight:700; cursor:default; }}
+    .winbtns {{ display:flex; gap:8px; }}
+    .wbtn {{
+      width:40px; height:26px; border-radius:10px; background:var(--b);
+      display:grid; place-items:center; cursor:pointer; user-select:none;
+    }}
+    .wbtn:hover {{ background:var(--b2); }}
+    .wbtn.close {{ background:var(--danger); }}
+    .toolbar {{ flex:1; display:flex; flex-direction:column; gap:8px; padding:8px 12px 10px; min-height:0; overflow:visible; }}
+    .tabs-bar {{ flex-shrink:0; }}
+    {tab_bar_css}
+    .row {{ display:flex; gap:8px; align-items:center; }}
+    .navbtn {{
+      width:36px; height:36px; border-radius:12px; background:var(--b);
+      display:grid; place-items:center; cursor:pointer; user-select:none;
+      font-size:16px; flex:0 0 auto;
+    }}
+    .navbtn:hover {{ background:var(--b2); }}
+    input {{
+      flex:1; min-width:200px; padding:10px 14px; border-radius:16px;
+      border:1px solid #3c4043; outline:none; background:#111; color:var(--fg);
+    }}
+    .go {{ padding:10px 14px; border-radius:16px; background:var(--b); cursor:pointer; user-select:none; flex:0 0 auto; }}
+    .go:hover {{ background:var(--b2); }}
+  </style>
+</head>
+<body>
+  <div class="chrome">
+    <div class="titlebar">
+      <div class="drag" onpointerdown="window.location.replace('{win_drag}')">{version}</div>
+      <div class="winbtns">
+        <div class="wbtn" title="Свернуть" onclick="window.location.replace('{win_min}')">—</div>
+        <div class="wbtn" title="Развернуть" onclick="window.location.replace('{win_max}')">□</div>
+        <div class="wbtn close" title="Закрыть" onclick="window.location.replace('{win_close}')">×</div>
+      </div>
+    </div>
+    <div class="toolbar">
+      <div class="tabs-bar">
+        <div class="tab-strip" id="tab-strip">{tabs_html}</div>
+        <div class="addtab" title="Новая вкладка" onclick="window.location.replace('{new_tab}')">+</div>
+      </div>
+      <div class="row">
+        <div class="navbtn" title="Назад" onclick="window.location.replace('{nav_back}')">←</div>
+        <div class="navbtn" title="Вперёд" onclick="window.location.replace('{nav_forward}')">→</div>
+        <div class="navbtn" title="Обновить" onclick="window.location.replace('{nav_reload}')">↻</div>
+        <div class="navbtn" title="Инструменты разработчика (F12)" onclick="window.location.replace('{nav_devtools}')">&#123; &#125;</div>
+        <input id="url" value="{cur_url_attr}" placeholder="адрес или поиск" autocomplete="off" spellcheck="false"
+          onkeydown="if(event.key==='Enter')window.location.replace('plum://ipc/load:'+encodeURIComponent(this.value))" />
+        <div class="go" onclick="window.location.replace('plum://ipc/load:'+encodeURIComponent(document.getElementById('url').value))">Go</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"#,
+        tab_bar_css = format!("{TAB_BAR_CSS}\n{WINDOWS_TAB_BAR_CSS}"),
+    )
+}
 
 fn toolbar_html() -> String {
     let toolbar_h = toolbar_height() as i32;
@@ -1375,10 +1588,13 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
             let _ = proxy_ipc.send_event(UserEvent::Ipc(req.body().clone()));
         });
 
-    let html = toolbar_html();
+    #[cfg(target_os = "windows")]
     let builder = builder
-        .with_html(&html)
+        .with_url("plum://toolbar/")
         .with_custom_protocol("plum".to_string(), plum_protocol);
+
+    #[cfg(not(target_os = "windows"))]
+    let builder = builder.with_html(&toolbar_html());
 
     #[cfg(target_os = "windows")]
     let builder = builder
@@ -1529,6 +1745,9 @@ fn main() {
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+
+    #[cfg(target_os = "windows")]
+    let _ = EVENT_PROXY.set(proxy.clone());
 
     let window = build_window(&event_loop);
     set_dock_icon();
@@ -1712,6 +1931,29 @@ fn main() {
                         sync_toolbar(&toolbar, &tabs, current);
                         focus_active_tab(&tabs, current);
                     } else {
+                        #[cfg(target_os = "windows")]
+                        sync_toolbar(&toolbar, &tabs, current);
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            let titles = tabs.iter().map(tab_label).collect::<Vec<_>>();
+                            let script = format!(
+                                "window.__setTabTitle({}, {});",
+                                idx,
+                                json!(titles[idx])
+                            );
+                            let _ = toolbar.evaluate_script(&script);
+                        }
+                    }
+                }
+            }
+
+            Event::UserEvent(UserEvent::TitleChanged { tab_id, title }) => {
+                if let Some(idx) = find_tab_idx(&tabs, tab_id) {
+                    tabs[idx].title = title;
+                    #[cfg(target_os = "windows")]
+                    sync_toolbar(&toolbar, &tabs, current);
+                    #[cfg(not(target_os = "windows"))]
+                    {
                         let titles = tabs.iter().map(tab_label).collect::<Vec<_>>();
                         let script = format!(
                             "window.__setTabTitle({}, {});",
@@ -1720,19 +1962,6 @@ fn main() {
                         );
                         let _ = toolbar.evaluate_script(&script);
                     }
-                }
-            }
-
-            Event::UserEvent(UserEvent::TitleChanged { tab_id, title }) => {
-                if let Some(idx) = find_tab_idx(&tabs, tab_id) {
-                    tabs[idx].title = title;
-                    let titles = tabs.iter().map(tab_label).collect::<Vec<_>>();
-                    let script = format!(
-                        "window.__setTabTitle({}, {});",
-                        idx,
-                        json!(titles[idx])
-                    );
-                    let _ = toolbar.evaluate_script(&script);
                 }
             }
 
@@ -1789,6 +2018,7 @@ fn main() {
                 "win_close" => *control_flow = ControlFlow::Exit,
 
                 "ready" => {
+                    #[cfg(not(target_os = "windows"))]
                     sync_toolbar(&toolbar, &tabs, current);
                     raise_toolbar(
                         &toolbar,
