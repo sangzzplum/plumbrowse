@@ -48,15 +48,58 @@ fn toolbar_height() -> f64 {
 }
 
 #[cfg(target_os = "windows")]
+fn debug_log_paths() -> Vec<PathBuf> {
+    let mut paths = vec![std::env::temp_dir().join("plumbrowser_debug.log")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            paths.push(dir.join("plumbrowser_debug.log"));
+        }
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        paths.push(PathBuf::from(local).join("PlumBrowser").join("debug.log"));
+    }
+    paths
+}
+
+#[cfg(target_os = "windows")]
+fn init_windows_debug_log() {
+    use std::io::Write;
+    let paths = debug_log_paths();
+    let stamp = format!(
+        "=== PlumBrowser {} start temp={} exe={:?} ===",
+        app_version(),
+        std::env::temp_dir().display(),
+        std::env::current_exe().ok()
+    );
+    for path in &paths {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{stamp}");
+            let _ = writeln!(file, "log_path={}", path.display());
+            let _ = file.flush();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn log_windows_debug(msg: &str) {
     use std::io::Write;
-    let path = std::env::temp_dir().join("plumbrowser_debug.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{msg}");
+    for path in debug_log_paths() {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{msg}");
+            let _ = file.flush();
+        }
     }
 }
 
@@ -91,6 +134,9 @@ fn log_windows_layout(toolbar: &WebView, tabs: &[Tab], label: &str) {
     };
 
     let _ = writeln!(file, "\n=== {label} ===");
+    for log_path in debug_log_paths() {
+        let _ = writeln!(file, "also: {}", log_path.display());
+    }
     if let Some(hwnd) = webview_host_hwnd(toolbar) {
         write_rect(&mut file, "toolbar", hwnd);
     } else {
@@ -180,55 +226,12 @@ fn sync_windows_z_order(
     }
 }
 
-/// Content HWND sometimes spans the full window while only painting below the toolbar.
-/// Clip hit-testing so clicks in the toolbar band reach the toolbar webview.
 #[cfg(target_os = "windows")]
-fn enforce_content_clipping(webview: &WebView, window: &Window) {
-    use tao::platform::windows::WindowExtWindows;
-    use windows::Win32::Foundation::{HWND, POINT, RECT};
-    use windows::Win32::Graphics::Gdi::{CreateRectRgn, MapWindowPoints, SetWindowRgn};
-    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
-
-    let Some(host) = webview_host_hwnd(webview) else {
-        return;
-    };
-    let scale = window.scale_factor();
-    let toolbar_phys = (toolbar_height() * scale).round() as i32;
-    let parent = HWND(window.hwnd() as _);
-
-    let mut host_rect = RECT::default();
-    if unsafe { GetWindowRect(host, &mut host_rect) }.is_err() {
-        return;
-    }
-
-    let mut top_left = POINT {
-        x: host_rect.left,
-        y: host_rect.top,
-    };
-    if unsafe { MapWindowPoints(None, Some(parent), std::slice::from_mut(&mut top_left)) } == 0 {
-        return;
-    }
-
-    if top_left.y >= toolbar_phys {
-        unsafe {
-            let _ = SetWindowRgn(host, None, true);
-        }
-        return;
-    }
-
-    let client_w = host_rect.right - host_rect.left;
-    let client_h = host_rect.bottom - host_rect.top;
-    let clip_top = (toolbar_phys - top_left.y).clamp(0, client_h);
-    if clip_top >= client_h {
-        return;
-    }
-
-    unsafe {
-        let rgn = CreateRectRgn(0, clip_top, client_w, client_h);
-        if !rgn.is_invalid() {
-            let _ = SetWindowRgn(host, Some(rgn), true);
-        }
-    }
+fn windows_toolbar_data_url(snap: &ToolbarSnapshot) -> String {
+    format!(
+        "data:text/html;charset=utf-8,{}",
+        percent_encode_ipc_path(&windows_toolbar_html(snap))
+    )
 }
 
 fn raise_toolbar(
@@ -393,6 +396,9 @@ fn toolbar_navigation_allowed(url: &str) -> bool {
         return true;
     }
     if url.starts_with("plum://") {
+        return true;
+    }
+    if url.starts_with("data:text/html") {
         return true;
     }
     !url.starts_with("http://")
@@ -682,7 +688,7 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
             snap.current = current;
             snap.cur_url = cur_url;
         }
-        match toolbar.load_url("plum://toolbar/") {
+        match toolbar.load_url(&windows_toolbar_data_url(&snap)) {
             Ok(()) => log_windows_debug("sync_toolbar reload ok"),
             Err(err) => log_windows_debug(&format!("sync_toolbar reload failed: {err}")),
         }
@@ -1171,6 +1177,19 @@ fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
     }}
     .go {{ padding:10px 14px; border-radius:16px; background:var(--b); cursor:pointer; user-select:none; flex:0 0 auto; }}
     .go:hover {{ background:var(--b2); }}
+    .tab {{
+      position:relative;
+      display:flex; align-items:center; gap:6px;
+      height:32px; min-width:80px; padding:0 28px 0 8px; border-radius:12px; background:var(--b);
+      cursor:pointer; user-select:none; box-sizing:border-box; color:var(--fg);
+    }}
+    .tab.active {{ background:var(--b2); }}
+    .tab-title {{ min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; flex:1 1 auto; }}
+    .tab-close {{
+      position:absolute; right:6px; top:4px;
+      width:24px; height:24px; border-radius:10px;
+      display:grid; place-items:center; color:var(--mut); font-weight:900;
+    }}
   </style>
 </head>
 <body>
@@ -1364,7 +1383,6 @@ fn build_content_webview(
     devtools_open: bool,
 ) -> WebView {
     let builder = WebViewBuilder::new()
-        .with_url(url)
         .with_user_agent(content_user_agent())
         .with_bounds(bounds_content(ww, wh, devtools_open))
         .with_visible(visible)
@@ -1420,9 +1438,26 @@ fn build_content_webview(
         .with_browser_accelerator_keys(false)
         .with_additional_browser_args("--remote-debugging-port=9222 --remote-allow-origins=*");
 
-    builder
+    #[cfg(target_os = "windows")]
+    let webview = if url == NEWTAB_URL {
+        builder
+            .with_html(NEWTAB_HTML)
+            .build_as_child(window)
+            .expect("failed to build content webview")
+    } else {
+        builder
+            .with_url(url)
+            .build_as_child(window)
+            .expect("failed to build content webview")
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let webview = builder
+        .with_url(url)
         .build_as_child(window)
-        .expect("failed to build content webview")
+        .expect("failed to build content webview");
+
+    webview
 }
 
 #[allow(unused_variables)]
@@ -1476,10 +1511,6 @@ fn resize_all(
     let bounds = bounds_content(ww, wh, devtools_open);
     for tab in tabs {
         let _ = tab.webview.set_bounds(bounds);
-    }
-    #[cfg(target_os = "windows")]
-    for tab in tabs {
-        enforce_content_clipping(&tab.webview, window);
     }
     #[cfg(target_os = "windows")]
     if let Some(panel) = devtools_panel {
@@ -1574,6 +1605,8 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         .with_initialization_script(TOOLBAR_LOCK_SCRIPT)
         .with_navigation_handler(move |url| {
             if let Some(msg) = toolbar_ipc_from_url(&url) {
+                #[cfg(target_os = "windows")]
+                log_windows_debug(&format!("toolbar nav ipc: {msg}"));
                 let _ = proxy_nav.send_event(UserEvent::Ipc(msg));
                 return false;
             }
@@ -1589,9 +1622,12 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         });
 
     #[cfg(target_os = "windows")]
-    let builder = builder
-        .with_url("plum://toolbar/")
-        .with_custom_protocol("plum".to_string(), plum_protocol);
+    let builder = {
+        let initial = ToolbarSnapshot::new_default();
+        builder
+            .with_url(&windows_toolbar_data_url(&initial))
+            .with_custom_protocol("plum".to_string(), plum_protocol)
+    };
 
     #[cfg(not(target_os = "windows"))]
     let builder = builder.with_html(&toolbar_html());
@@ -1738,6 +1774,9 @@ fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
 
 fn main() {
     #[cfg(target_os = "windows")]
+    init_windows_debug_log();
+
+    #[cfg(target_os = "windows")]
     std::env::set_var(
         "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
         "--remote-debugging-port=9222 --remote-allow-origins=*",
@@ -1839,6 +1878,21 @@ fn main() {
                         Some(&devtools_panel),
                     );
                     sync_toolbar(&toolbar, &tabs, current);
+                }
+
+                #[cfg(target_os = "windows")]
+                WindowEvent::CursorMoved { position, .. } => {
+                    let scale = window.scale_factor();
+                    let y = position.to_logical::<f64>(scale).y;
+                    if y < toolbar_height() {
+                        raise_toolbar(
+                            &toolbar,
+                            &window,
+                            Some(&tabs),
+                            Some(&devtools_panel),
+                        );
+                        let _ = toolbar.focus();
+                    }
                 }
 
                 WindowEvent::ScaleFactorChanged {
