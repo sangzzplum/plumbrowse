@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use tao::{
     dpi::PhysicalSize,
-    event::{ElementState, Event, WindowEvent},
+    event::{ElementState, Event, StartCause, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     keyboard::{KeyCode, ModifiersState},
     window::{Icon, Window, WindowBuilder},
@@ -21,7 +21,7 @@ use wry::{
 use tao::platform::macos::WindowBuilderExtMacOS;
 
 #[cfg(target_os = "windows")]
-use wry::WebViewBuilderExtWindows;
+use wry::{Theme, WebViewBuilderExtWindows, WebViewExtWindows};
 
 fn logical_size(window: &Window) -> (f64, f64) {
     let size = window
@@ -60,11 +60,27 @@ fn raise_toolbar(toolbar: &WebView, window: &Window) {
 
     #[cfg(target_os = "windows")]
     {
-        use tao::platform::windows::WindowExtWindows;
-        use wry::WebViewExtWindows;
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        };
 
-        // Reparent to the same HWND refreshes z-order (newer webviews cover toolbar otherwise).
-        let _ = toolbar.reparent(window.hwnd());
+        let controller = toolbar.controller();
+        unsafe {
+            let mut hwnd = HWND::default();
+            if controller.ParentWindow(&mut hwnd).is_ok() {
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+        let _ = window;
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -188,9 +204,6 @@ fn app_version() -> &'static str {
 fn version_label() -> String {
     format!("PlumBrowser v{}", app_version())
 }
-
-#[cfg(target_os = "windows")]
-const TOOLBAR_PROTOCOL_URL: &str = "plum://toolbar/";
 
 fn toolbar_navigation_allowed(url: &str) -> bool {
     // WebView2 maps custom schemes to http(s)://plum.* — must allow those through.
@@ -1020,16 +1033,27 @@ fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
     tabs.iter().position(|t| t.id == tab_id)
 }
 
+#[cfg(target_os = "windows")]
+fn refresh_windows_toolbar(toolbar: &WebView, window: &Window, ww: f64) {
+    let html = toolbar_html();
+    let _ = toolbar.set_bounds(bounds_toolbar(ww));
+    let _ = toolbar.set_visible(true);
+    let _ = toolbar.set_theme(Theme::Dark);
+    let _ = toolbar.load_html(&html);
+    raise_toolbar(toolbar, window);
+}
+
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
+    let html = toolbar_html();
     let mut builder = WebViewBuilder::new()
         .with_bounds(bounds_toolbar(ww))
         .with_background_color(TOOLBAR_BG)
+        .with_visible(true)
         .with_focused(false)
         .with_accept_first_mouse(true)
         .with_devtools(false)
         .with_hotkeys_zoom(false)
         .with_back_forward_navigation_gestures(false)
-        .with_navigation_handler(|url| toolbar_navigation_allowed(&url))
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
         .with_initialization_script(TOOLBAR_LOCK_SCRIPT)
         .with_ipc_handler(move |req: Request<String>| {
@@ -1038,21 +1062,32 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
 
     #[cfg(target_os = "windows")]
     {
+        // Windows: inline HTML only. Custom-scheme top-level loads are unreliable as a toolbar doc.
         builder = builder
-            .with_url(TOOLBAR_PROTOCOL_URL)
-            .with_custom_protocol("plum".to_string(), plum_protocol)
+            .with_html(&html)
             .with_default_context_menus(false)
             .with_browser_accelerator_keys(false);
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        builder = builder.with_html(toolbar_html());
+        builder = builder
+            .with_html(&html)
+            .with_navigation_handler(|url| toolbar_navigation_allowed(&url));
     }
 
-    builder
+    let toolbar = builder
         .build_as_child(window)
-        .expect("failed to build toolbar webview")
+        .expect("failed to build toolbar webview");
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = toolbar.set_theme(Theme::Dark);
+        let _ = toolbar.load_html(&html);
+        raise_toolbar(&toolbar, window);
+    }
+
+    toolbar
 }
 
 #[cfg(target_os = "windows")]
@@ -1186,6 +1221,10 @@ fn main() {
     let mut devtools_open = false;
     let mut modifiers = ModifiersState::empty();
 
+    // Windows: create toolbar before content webviews (z-order + WebView2 env).
+    #[cfg(target_os = "windows")]
+    let toolbar = build_toolbar(&window, proxy.clone(), ww);
+
     let first_webview = build_content_webview(
         &window,
         proxy.clone(),
@@ -1206,7 +1245,9 @@ fn main() {
     }];
     let mut current: usize = 0;
 
+    #[cfg(not(target_os = "windows"))]
     let toolbar = build_toolbar(&window, proxy.clone(), ww);
+
     raise_toolbar(&toolbar, &window);
     sync_toolbar(&toolbar, &tabs, current);
 
@@ -1217,6 +1258,11 @@ fn main() {
         *control_flow = ControlFlow::Wait;
 
         match event {
+            Event::NewEvents(StartCause::Init) => {
+                #[cfg(target_os = "windows")]
+                refresh_windows_toolbar(&toolbar, &window, ww);
+            }
+
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
 
