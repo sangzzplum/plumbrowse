@@ -21,7 +21,7 @@ use wry::{
 use tao::platform::macos::WindowBuilderExtMacOS;
 
 #[cfg(target_os = "windows")]
-use wry::{Theme, WebViewBuilderExtWindows};
+use wry::{Theme, WebViewBuilderExtWindows, WebViewExtWindows};
 
 fn logical_size(window: &Window) -> (f64, f64) {
     let size = window
