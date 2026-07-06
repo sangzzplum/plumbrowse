@@ -272,6 +272,10 @@ const NEWTAB_URL: &str = "plum://newtab";
 const DEVTOOLS_WIDTH: f64 = 420.0;
 const TOOLBAR_BG: RGBA = (32, 33, 36, 255);
 
+#[cfg(target_os = "windows")]
+const IPC_NAV_BACK_HTML: &[u8] =
+    br#"<html><head><script>try{history.length>1&&history.back();}catch(e){}</script></head><body></body></html>"#;
+
 fn app_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -478,7 +482,7 @@ fn enforce_content_below_toolbar(
         };
         let mut pt = POINT { x: 0, y: 0 };
         unsafe {
-            let _ = MapWindowPoints(Some(host), Some(parent), std::slice::from_mut(&mut pt), 1);
+            let _ = MapWindowPoints(Some(host), Some(parent), std::slice::from_mut(&mut pt));
         }
         if pt.y < min_y {
             let _ = tab.webview.set_bounds(bounds_content(ww, wh, devtools_open));
@@ -628,9 +632,7 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
         return Response::builder()
             .status(200)
             .header(CONTENT_TYPE, "text/html; charset=utf-8")
-            .body(Cow::Borrowed(
-                &br#"<html><head><script>try{history.length>1&&history.back();}catch(e){}</script></head><body></body></html>"#,
-            ))
+            .body(Cow::Borrowed(IPC_NAV_BACK_HTML))
             .unwrap();
     }
 
