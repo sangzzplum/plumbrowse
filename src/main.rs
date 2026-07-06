@@ -682,12 +682,16 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
 
     #[cfg(target_os = "windows")]
     {
-        if let Ok(mut snap) = toolbar_snapshot().lock() {
+        let snap = {
+            let mut snap = toolbar_snapshot()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             snap.titles = titles;
             snap.urls = urls;
             snap.current = current;
             snap.cur_url = cur_url;
-        }
+            snap.clone()
+        };
         match toolbar.load_url(&windows_toolbar_data_url(&snap)) {
             Ok(()) => log_windows_debug("sync_toolbar reload ok"),
             Err(err) => log_windows_debug(&format!("sync_toolbar reload failed: {err}")),
