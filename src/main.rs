@@ -31,6 +31,9 @@ use wry::{Theme, WebViewBuilderExtWindows, WebViewExtWindows};
 #[cfg(target_os = "windows")]
 static TOOLBAR_IPC: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
 
+#[cfg(target_os = "windows")]
+static APP_STARTED: OnceLock<std::time::Instant> = OnceLock::new();
+
 fn logical_size(window: &Window) -> (f64, f64) {
     let size = window
         .inner_size()
@@ -750,10 +753,7 @@ const TOOLBAR_SCRIPT: &str = r#"
 
     function bindBtn(id, fn) {
       const el = document.getElementById(id);
-      if (!el) return;
-      const href = el.getAttribute && el.getAttribute('href');
-      if (href && href.startsWith('plum://ipc/')) return;
-      el.addEventListener('click', fn);
+      if (el) el.addEventListener('click', fn);
     }
 
     function initToolbar() {
@@ -788,9 +788,7 @@ const TOOLBAR_SCRIPT: &str = r#"
       const urlInput = document.getElementById('url');
       const go = document.getElementById('go');
       if (go && urlInput) {
-        if (!go.getAttribute('href')?.startsWith('plum://ipc/')) {
-          go.addEventListener('click', () => post('load:' + urlInput.value));
-        }
+        go.addEventListener('click', () => post('load:' + urlInput.value));
         urlInput.addEventListener('keydown', (e) => {
           if (e.key === 'Enter') post('load:' + e.target.value);
         });
@@ -798,7 +796,6 @@ const TOOLBAR_SCRIPT: &str = r#"
       }
 
       post('ready');
-      [50, 200, 500].forEach((ms) => setTimeout(() => post('ready'), ms));
     }
 
     const TAB_MIN = 32;
@@ -1077,29 +1074,28 @@ fn toolbar_html() -> String {
     }}
     .drag {{ flex:1; height:100%; display:flex; align-items:center; color:var(--mut); font-weight:700; cursor:default; }}
     .winbtns {{ display:flex; gap:8px; }}
-    .wbtn, a.wbtn {{
+    .wbtn {{
       width:40px; height:26px; border-radius:10px; background:var(--b);
-      display:grid; place-items:center; cursor:pointer; text-decoration:none; color:inherit;
+      display:grid; place-items:center; cursor:pointer; user-select:none;
     }}
-    .wbtn:hover, a.wbtn:hover {{ background:var(--b2); }}
-    .wbtn.close, a.wbtn.close {{ background:var(--danger); }}
+    .wbtn:hover {{ background:var(--b2); }}
+    .wbtn.close {{ background:var(--danger); }}
     .toolbar {{ flex:1; display:flex; flex-direction:column; gap:8px; padding:8px 12px 10px; min-height:0; overflow:visible; }}
     .tabs-bar {{ flex-shrink:0; }}
     {tab_bar_css}
-    .navbtn, a.navbtn, .addtab, a.addtab, .go, a.go {{ text-decoration:none; color:inherit; }}
     .row {{ display:flex; gap:8px; align-items:center; }}
-    .navbtn, a.navbtn {{
+    .navbtn {{
       width:36px; height:36px; border-radius:12px; background:var(--b);
       display:grid; place-items:center; cursor:pointer; user-select:none;
       font-size:16px; flex:0 0 auto;
     }}
-    .navbtn:hover, a.navbtn:hover {{ background:var(--b2); }}
+    .navbtn:hover {{ background:var(--b2); }}
     input {{
       flex:1; min-width:200px; padding:10px 14px; border-radius:16px;
       border:1px solid #3c4043; outline:none; background:#111; color:var(--fg);
     }}
-    .go, a.go {{ padding:10px 14px; border-radius:16px; background:var(--b); cursor:pointer; user-select:none; flex:0 0 auto; display:grid; place-items:center; }}
-    .go:hover, a.go:hover {{ background:var(--b2); }}
+    .go {{ padding:10px 14px; border-radius:16px; background:var(--b); cursor:pointer; user-select:none; flex:0 0 auto; }}
+    .go:hover {{ background:var(--b2); }}
   </style>
 </head>
 <body>
@@ -1107,24 +1103,24 @@ fn toolbar_html() -> String {
     <div class="titlebar">
       <div class="drag" id="drag">{version}</div>
       <div class="winbtns">
-        <a class="wbtn" id="min" href="plum://ipc/win_min" title="Свернуть">—</a>
-        <a class="wbtn" id="max" href="plum://ipc/win_max_toggle" title="Развернуть">□</a>
-        <a class="wbtn close" id="close" href="plum://ipc/win_close" title="Закрыть">×</a>
+        <div class="wbtn" id="min" title="Свернуть">—</div>
+        <div class="wbtn" id="max" title="Развернуть">□</div>
+        <div class="wbtn close" id="close" title="Закрыть">×</div>
       </div>
     </div>
     <div class="toolbar">
       <div class="tabs-bar">
         <div class="tab-strip" id="tab-strip"></div>
-        <a class="addtab" id="addtab-inline" href="plum://ipc/new_tab%3A" title="Новая вкладка">+</a>
-        <a class="addtab" id="addtab-fixed" href="plum://ipc/new_tab%3A" title="Новая вкладка" style="display:none">+</a>
+        <div class="addtab" id="addtab-inline" title="Новая вкладка">+</div>
+        <div class="addtab" id="addtab-fixed" title="Новая вкладка" style="display:none">+</div>
       </div>
       <div class="row">
-        <a class="navbtn" id="back" href="plum://ipc/nav_back" title="Назад">←</a>
-        <a class="navbtn" id="forward" href="plum://ipc/nav_forward" title="Вперёд">→</a>
-        <a class="navbtn" id="reload" href="plum://ipc/nav_reload" title="Обновить">↻</a>
-        <a class="navbtn" id="devtools" href="plum://ipc/nav_devtools" title="Инструменты разработчика (F12)">&#123; &#125;</a>
+        <div class="navbtn" id="back" title="Назад">←</div>
+        <div class="navbtn" id="forward" title="Вперёд">→</div>
+        <div class="navbtn" id="reload" title="Обновить">↻</div>
+        <div class="navbtn" id="devtools" title="Инструменты разработчика (F12)">&#123; &#125;</div>
         <input id="url" placeholder="адрес или поиск" autocomplete="off" spellcheck="false" />
-        <a class="go" id="go" href="javascript:void(0)" onclick="post('load:'+document.getElementById('url').value);return false;">Go</a>
+        <div class="go" id="go">Go</div>
       </div>
     </div>
   </div>
@@ -1532,6 +1528,9 @@ fn main() {
     #[cfg(target_os = "windows")]
     let _ = TOOLBAR_IPC.set(proxy.clone());
 
+    #[cfg(target_os = "windows")]
+    let _ = APP_STARTED.set(std::time::Instant::now());
+
     let window = build_window(&event_loop);
     set_dock_icon();
 
@@ -1604,11 +1603,8 @@ fn main() {
         enforce_content_below_toolbar(&window, &toolbar, &tabs, devtools_open);
         let layout_proxy = proxy.clone();
         std::thread::spawn(move || {
-            for ms in [150u64, 400, 800] {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-                let _ = layout_proxy.send_event(UserEvent::DeferredLayout);
-                let _ = layout_proxy.send_event(UserEvent::Ipc("ready".to_string()));
-            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = layout_proxy.send_event(UserEvent::DeferredLayout);
         });
     }
 
@@ -1825,7 +1821,23 @@ fn main() {
                     );
                     sync_toolbar(&toolbar, &tabs, current);
                 }
-                "win_close" => *control_flow = ControlFlow::Exit,
+                "win_close" => {
+                    let should_close = {
+                        #[cfg(target_os = "windows")]
+                        {
+                            APP_STARTED.get().is_some_and(|t| {
+                                t.elapsed() > std::time::Duration::from_secs(1)
+                            })
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            true
+                        }
+                    };
+                    if should_close {
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
 
                 "ready" => {
                     #[cfg(target_os = "windows")]
