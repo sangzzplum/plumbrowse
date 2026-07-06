@@ -44,7 +44,85 @@ fn toolbar_height() -> f64 {
 }
 
 /// Поднимаем toolbar поверх content-webview (на macOS и Windows child webviews наслаиваются).
-fn raise_toolbar(toolbar: &WebView, window: &Window) {
+#[cfg(target_os = "windows")]
+fn webview_host_hwnd(webview: &WebView) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Foundation::HWND;
+    use wry::WebViewExtWindows;
+
+    let controller = webview.controller();
+    let mut host = HWND::default();
+    unsafe {
+        controller.ParentWindow(&mut host).ok()?;
+    }
+    if host.0.is_null() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn sync_windows_z_order(
+    toolbar: &WebView,
+    tabs: &[Tab],
+    devtools_panel: Option<&WebView>,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_BOTTOM, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+        SWP_NOSIZE,
+    };
+
+    for tab in tabs {
+        if let Some(host) = webview_host_hwnd(&tab.webview) {
+            unsafe {
+                let _ = SetWindowPos(
+                    host,
+                    Some(HWND_BOTTOM),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                );
+            }
+        }
+    }
+    if let Some(panel) = devtools_panel {
+        if let Some(host) = webview_host_hwnd(panel) {
+            unsafe {
+                let _ = SetWindowPos(
+                    host,
+                    Some(HWND_BOTTOM),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                );
+            }
+        }
+    }
+    if let Some(host) = webview_host_hwnd(toolbar) {
+        unsafe {
+            let _ = SetWindowPos(
+                host,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+        }
+    }
+}
+
+fn raise_toolbar(
+    toolbar: &WebView,
+    window: &Window,
+    tabs: Option<&[Tab]>,
+    #[cfg(target_os = "windows")] devtools_panel: Option<&WebView>,
+) {
     #[cfg(target_os = "macos")]
     {
         use objc2_app_kit::NSWindowOrderingMode;
@@ -55,49 +133,32 @@ fn raise_toolbar(toolbar: &WebView, window: &Window) {
         if let Some(superview) = unsafe { view.superview() } {
             superview.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Above, None);
         }
-        let _ = window;
+        let _ = (window, tabs);
     }
 
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        };
-        use wry::WebViewExtWindows;
-
         let (ww, _) = logical_size(window);
         let _ = toolbar.set_bounds(bounds_toolbar(ww));
         let _ = toolbar.set_visible(true);
-
-        // Content webviews are created after toolbar and steal z-order — put toolbar on top.
-        let controller = toolbar.controller();
-        let mut host = HWND::default();
-        unsafe {
-            if controller.ParentWindow(&mut host).is_ok() {
-                let _ = SetWindowPos(
-                    host,
-                    Some(HWND_TOP),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
+        if let Some(tabs) = tabs {
+            sync_windows_z_order(toolbar, tabs, devtools_panel);
         }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let _ = (toolbar, window);
+        let _ = (toolbar, window, tabs);
     }
 }
 
 fn focus_active_tab(tabs: &[Tab], current: usize) {
+    #[cfg(not(target_os = "windows"))]
     if let Some(tab) = tabs.get(current) {
         let _ = tab.webview.focus();
     }
+    #[cfg(target_os = "windows")]
+    let _ = (tabs, current);
 }
 
 fn load_window_icon() -> Option<Icon> {
@@ -313,6 +374,53 @@ fn percent_encode_query(s: &str) -> String {
     out
 }
 
+#[cfg(target_os = "windows")]
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(byte) = u8::from_str_radix(
+                    std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                    16,
+                ) {
+                    out.push(byte);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(target_os = "windows")]
+fn toolbar_ipc_from_navigation(url: &str) -> Option<String> {
+    const MARKERS: &[&str] = &["plum://ipc/", "http://plum.ipc/", "https://plum.ipc/"];
+    for marker in MARKERS {
+        if let Some(rest) = url.find(marker) {
+            let payload = &url[rest + marker.len()..];
+            let payload = payload.split(&['#', '?'][..]).next().unwrap_or(payload);
+            if !payload.is_empty() {
+                return Some(percent_decode(payload));
+            }
+        }
+    }
+    None
+}
+
 fn resolve_omnibox_input(input: &str) -> Option<String> {
     let u = input.trim();
     if u.is_empty() {
@@ -397,11 +505,31 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
     let cur_url = tabs.get(current).map(|t| t.url.as_str()).unwrap_or("");
 
     let script = format!(
-        "if (typeof window.__setState === 'function') {{ window.__setState({}, {}, {}, {}); }}",
-        json!(titles),
-        json!(urls),
-        current,
-        json!(cur_url)
+        r#"(function(){{
+  var titles = {titles};
+  var urls = {urls};
+  var cur = {current};
+  var url = {cur_url};
+  function apply() {{
+    if (typeof window.__setState === 'function') {{
+      window.__setState(titles, urls, cur, url);
+      return true;
+    }}
+    return false;
+  }}
+  if (!apply()) {{
+    window.__pendingState = [titles, urls, cur, url];
+    var tries = 0;
+    (function retry() {{
+      if (apply() || ++tries > 120) return;
+      requestAnimationFrame(retry);
+    }})();
+  }}
+}})();"#,
+        titles = json!(titles),
+        urls = json!(urls),
+        current = current,
+        cur_url = json!(cur_url)
     );
     let _ = toolbar.evaluate_script(&script);
 }
@@ -481,14 +609,20 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
 const TOOLBAR_SCRIPT: &str = r#"
     function post(msg) {
       try {
+        if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+          window.chrome.webview.postMessage(msg);
+          return;
+        }
         if (window.ipc && window.ipc.postMessage) {
           window.ipc.postMessage(msg);
           return;
         }
-        if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
-          window.chrome.webview.postMessage(msg);
-        }
       } catch (e) {}
+      if (window.__PLUM_IPC_NAV) {
+        try {
+          window.location.href = 'plum://ipc/' + encodeURIComponent(msg);
+        } catch (e2) {}
+      }
     }
 
     function svgFallbackDataUrl() {
@@ -567,6 +701,7 @@ const TOOLBAR_SCRIPT: &str = r#"
       }
 
       post('ready');
+      [50, 200, 500].forEach((ms) => setTimeout(() => post('ready'), ms));
     }
 
     const TAB_MIN = 32;
@@ -679,6 +814,12 @@ const TOOLBAR_SCRIPT: &str = r#"
     } else {
       initToolbar();
     }
+
+    if (window.__pendingState && typeof window.__setState === 'function') {
+      const pending = window.__pendingState;
+      window.__setState(pending[0], pending[1], pending[2], pending[3]);
+      delete window.__pendingState;
+    }
 "#;
 
 const TAB_BAR_CSS: &str = r#"
@@ -727,6 +868,26 @@ const TAB_BAR_CSS: &str = r#"
     .tab-strip.scroll .tab-close { position:static; right:auto; top:auto; }
     .tab-strip.scroll .tab:hover .tab-icon { opacity:0; }
     .tab-strip.scroll .tab:hover .tab-close { opacity:1; pointer-events:auto; }
+"#;
+
+const WINDOWS_TAB_BAR_CSS: &str = r#"
+    .tabs-bar {
+      display:grid;
+      grid-template-columns:minmax(0,1fr) 36px;
+      align-items:center;
+      gap:8px;
+      height:32px;
+      min-height:32px;
+      width:100%;
+    }
+    .tab-strip {
+      grid-column:1;
+      min-width:0;
+      width:100%;
+    }
+    #addtab-inline { grid-column:2; }
+    #addtab-fixed { grid-column:2; }
+    .toolbar { position:relative; }
 "#;
 
 fn toolbar_html() -> String {
@@ -867,11 +1028,12 @@ fn toolbar_html() -> String {
       </div>
     </div>
   </div>
+  <script>window.__PLUM_IPC_NAV=true;</script>
   <script>{script}</script>
 </body>
 </html>"#,
         script = TOOLBAR_SCRIPT,
-        tab_bar_css = TAB_BAR_CSS,
+        tab_bar_css = format!("{TAB_BAR_CSS}\n{WINDOWS_TAB_BAR_CSS}"),
         version = version
     )
 }
@@ -976,7 +1138,13 @@ fn show_tab(
         }
     }
     focus_active_tab(tabs, current);
-    raise_toolbar(toolbar, window);
+    raise_toolbar(
+        toolbar,
+        window,
+        Some(tabs),
+        #[cfg(target_os = "windows")]
+        devtools_panel,
+    );
 }
 
 #[allow(unused_variables)]
@@ -998,6 +1166,7 @@ fn resize_all(
     if let Some(panel) = devtools_panel {
         let _ = panel.set_bounds(bounds_devtools_panel(ww, wh));
         let _ = panel.set_visible(devtools_open);
+        sync_windows_z_order(toolbar, tabs, Some(panel));
     }
 }
 
@@ -1054,7 +1223,13 @@ fn toggle_devtools(
         #[cfg(target_os = "windows")]
         devtools_panel,
     );
-    raise_toolbar(toolbar, window);
+    raise_toolbar(
+        toolbar,
+        window,
+        Some(tabs),
+        #[cfg(target_os = "windows")]
+        devtools_panel,
+    );
     focus_active_tab(tabs, current);
 }
 
@@ -1087,10 +1262,18 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
 
     #[cfg(target_os = "windows")]
     {
+        let proxy_nav = proxy.clone();
         builder = builder
             .with_html(&html)
             .with_default_context_menus(false)
-            .with_browser_accelerator_keys(false);
+            .with_browser_accelerator_keys(false)
+            .with_navigation_handler(move |url| {
+                if let Some(msg) = toolbar_ipc_from_navigation(&url) {
+                    let _ = proxy_nav.send_event(UserEvent::Ipc(msg));
+                    return false;
+                }
+                !url.starts_with("http://") && !url.starts_with("https://")
+            });
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1193,7 +1376,13 @@ fn open_new_tab(
         devtools_panel,
     );
     focus_active_tab(tabs, *current);
-    raise_toolbar(toolbar, window);
+    raise_toolbar(
+        toolbar,
+        window,
+        Some(tabs),
+        #[cfg(target_os = "windows")]
+        devtools_panel,
+    );
 }
 
 fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
@@ -1273,7 +1462,13 @@ fn main() {
     #[cfg(target_os = "windows")]
     let devtools_panel = build_devtools_panel(&window, ww, wh);
 
-    raise_toolbar(&toolbar, &window);
+    raise_toolbar(
+        &toolbar,
+        &window,
+        Some(&tabs),
+        #[cfg(target_os = "windows")]
+        Some(&devtools_panel),
+    );
 
     #[cfg(target_os = "windows")]
     {
@@ -1315,7 +1510,13 @@ fn main() {
                         #[cfg(target_os = "windows")]
                         Some(&devtools_panel),
                     );
-                    raise_toolbar(&toolbar, &window);
+                    raise_toolbar(
+                        &toolbar,
+                        &window,
+                        Some(&tabs),
+                        #[cfg(target_os = "windows")]
+                        Some(&devtools_panel),
+                    );
                     sync_toolbar(&toolbar, &tabs, current);
                 }
 
@@ -1334,7 +1535,13 @@ fn main() {
                         #[cfg(target_os = "windows")]
                         Some(&devtools_panel),
                     );
-                    raise_toolbar(&toolbar, &window);
+                    raise_toolbar(
+                        &toolbar,
+                        &window,
+                        Some(&tabs),
+                        #[cfg(target_os = "windows")]
+                        Some(&devtools_panel),
+                    );
                 }
 
                 WindowEvent::ModifiersChanged(m) => modifiers = m,
@@ -1465,7 +1672,13 @@ fn main() {
                         #[cfg(target_os = "windows")]
                         Some(&devtools_panel),
                     );
-                    raise_toolbar(&toolbar, &window);
+                    raise_toolbar(
+                        &toolbar,
+                        &window,
+                        Some(&tabs),
+                        #[cfg(target_os = "windows")]
+                        Some(&devtools_panel),
+                    );
                     sync_toolbar(&toolbar, &tabs, current);
                 }
                 "win_close" => *control_flow = ControlFlow::Exit,
@@ -1507,9 +1720,16 @@ fn main() {
                             tabs[current].url = url.clone();
                             tabs[current].title.clear();
                             let _ = tabs[current].webview.load_url(&url);
+                            #[cfg(not(target_os = "windows"))]
                             let _ = tabs[current].webview.focus();
                             sync_toolbar(&toolbar, &tabs, current);
-                            raise_toolbar(&toolbar, &window);
+                            raise_toolbar(
+                                &toolbar,
+                                &window,
+                                Some(&tabs),
+                                #[cfg(target_os = "windows")]
+                                Some(&devtools_panel),
+                            );
                         }
                     }
                 }
