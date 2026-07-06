@@ -77,7 +77,7 @@ fn raise_toolbar(toolbar: &WebView, window: &Window) {
             if controller.ParentWindow(&mut host).is_ok() {
                 let _ = SetWindowPos(
                     host,
-                    HWND_TOP,
+                    Some(HWND_TOP),
                     0,
                     0,
                     0,
