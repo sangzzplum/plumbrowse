@@ -1752,33 +1752,32 @@ fn open_new_tab(
 }
 
 #[cfg(target_os = "windows")]
-static WIN_IPC_HOST: OnceLock<WinIpcHost> = OnceLock::new();
+struct WindowsRunState {
+    window: Window,
+    toolbar: WebView,
+    devtools_panel: WebView,
+    tabs: Vec<Tab>,
+    current: usize,
+    next_id: u32,
+    ww: f64,
+    wh: f64,
+    devtools_open: bool,
+    modifiers: ModifiersState,
+    z_order_nudges: u32,
+    proxy: EventLoopProxy<UserEvent>,
+}
+
+#[cfg(target_os = "windows")]
+static WIN_APP_PTR: OnceLock<*mut WindowsRunState> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
 static WIN_IPC_FALLBACK: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
+static WIN_IPC_BUSY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "windows")]
 static WIN_EXIT: AtomicBool = AtomicBool::new(false);
-
-#[cfg(target_os = "windows")]
-struct WinIpcHost {
-    window: *const Window,
-    toolbar: *const WebView,
-    tabs: *mut Vec<Tab>,
-    current: *mut usize,
-    next_id: *mut u32,
-    proxy: *const EventLoopProxy<UserEvent>,
-    ww: *mut f64,
-    wh: *mut f64,
-    devtools_open: *mut bool,
-    devtools_panel: *const WebView,
-}
-
-#[cfg(target_os = "windows")]
-unsafe impl Send for WinIpcHost {}
-
-#[cfg(target_os = "windows")]
-unsafe impl Sync for WinIpcHost {}
 
 #[cfg(target_os = "windows")]
 fn win_ipc_fallback() -> &'static Mutex<Vec<String>> {
@@ -1786,32 +1785,10 @@ fn win_ipc_fallback() -> &'static Mutex<Vec<String>> {
 }
 
 #[cfg(target_os = "windows")]
-fn install_win_ipc_host(
-    window: &Window,
-    toolbar: &WebView,
-    tabs: &mut Vec<Tab>,
-    current: &mut usize,
-    next_id: &mut u32,
-    proxy: &EventLoopProxy<UserEvent>,
-    ww: &mut f64,
-    wh: &mut f64,
-    devtools_open: &mut bool,
-    devtools_panel: &WebView,
-) {
-    let host = WinIpcHost {
-        window: (window as *const Window).cast(),
-        toolbar: (toolbar as *const WebView).cast(),
-        tabs: (tabs as *mut Vec<Tab>).cast(),
-        current: (current as *mut usize).cast(),
-        next_id: (next_id as *mut u32).cast(),
-        proxy: (proxy as *const EventLoopProxy<UserEvent>).cast(),
-        ww: (ww as *mut f64).cast(),
-        wh: (wh as *mut f64).cast(),
-        devtools_open: (devtools_open as *mut bool).cast(),
-        devtools_panel: (devtools_panel as *const WebView).cast(),
-    };
-    let _ = WIN_IPC_HOST.set(host);
-    log_windows_debug("win ipc host installed");
+fn register_win_app(app: &mut WindowsRunState) {
+    let ptr = (app as *mut WindowsRunState).cast();
+    let _ = WIN_APP_PTR.set(ptr);
+    log_windows_debug(&format!("win ipc host installed ptr={ptr:p}"));
     let pending = win_ipc_fallback()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1824,30 +1801,54 @@ fn install_win_ipc_host(
 
 #[cfg(target_os = "windows")]
 fn dispatch_win_ipc(msg: &str) {
-    let Some(host) = WIN_IPC_HOST.get() else {
-        win_ipc_fallback().lock().unwrap_or_else(|e| e.into_inner()).push(msg.to_string());
+    let Some(ptr) = WIN_APP_PTR.get() else {
+        win_ipc_fallback()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(msg.to_string());
         log_windows_debug(&format!("ipc queued (host pending): {msg}"));
         return;
     };
 
+    if WIN_IPC_BUSY.swap(true, Ordering::SeqCst) {
+        win_ipc_fallback()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(msg.to_string());
+        log_windows_debug(&format!("ipc queued (busy): {msg}"));
+        return;
+    }
+
     log_windows_debug(&format!("handled ipc: {msg}"));
     let mut flow = ControlFlow::Wait;
     unsafe {
+        let app = &mut *ptr.cast::<WindowsRunState>();
         let mut ctx = IpcContext {
             control_flow: &mut flow,
-            window: &*host.window,
-            toolbar: &*host.toolbar,
-            tabs: &mut *host.tabs,
-            current: &mut *host.current,
-            next_id: &mut *host.next_id,
-            proxy: &*host.proxy,
-            ww: &mut *host.ww,
-            wh: &mut *host.wh,
-            devtools_open: &mut *host.devtools_open,
-            devtools_panel: Some(&*host.devtools_panel),
+            window: &app.window,
+            toolbar: &app.toolbar,
+            tabs: &mut app.tabs,
+            current: &mut app.current,
+            next_id: &mut app.next_id,
+            proxy: &app.proxy,
+            ww: &mut app.ww,
+            wh: &mut app.wh,
+            devtools_open: &mut app.devtools_open,
+            devtools_panel: Some(&app.devtools_panel),
         };
         process_ipc(msg, &mut ctx);
     }
+    WIN_IPC_BUSY.store(false, Ordering::SeqCst);
+
+    let pending = win_ipc_fallback()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect::<Vec<_>>();
+    for queued in pending {
+        dispatch_win_ipc(&queued);
+    }
+
     if matches!(flow, ControlFlow::Exit) {
         WIN_EXIT.store(true, Ordering::SeqCst);
         if let Some(proxy) = EVENT_PROXY.get() {
@@ -2077,22 +2078,6 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
         }
         _ => {}
     }
-}
-
-#[cfg(target_os = "windows")]
-struct WindowsRunState {
-    window: Window,
-    toolbar: WebView,
-    devtools_panel: WebView,
-    tabs: Vec<Tab>,
-    current: usize,
-    next_id: u32,
-    ww: f64,
-    wh: f64,
-    devtools_open: bool,
-    modifiers: ModifiersState,
-    z_order_nudges: u32,
-    proxy: EventLoopProxy<UserEvent>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2364,6 +2349,63 @@ fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
 }
 
 
+#[cfg(target_os = "windows")]
+fn run_windows_app(
+    event_loop: tao::event_loop::EventLoop<UserEvent>,
+    state: WindowsRunState,
+) {
+    log_windows_debug("run_windows_app start");
+    let mut win_app = Box::new(state);
+    register_win_app(win_app.as_mut());
+
+    {
+        let app = win_app.as_mut();
+        app.window.set_visible(true);
+        raise_toolbar(
+            &app.toolbar,
+            &app.window,
+            Some(&app.tabs),
+            Some(&app.devtools_panel),
+        );
+        resize_all(
+            &app.window,
+            &app.toolbar,
+            &app.tabs,
+            app.ww,
+            app.wh,
+            app.devtools_open,
+            Some(&app.devtools_panel),
+        );
+        sync_toolbar(&app.toolbar, &app.tabs, app.current);
+        log_windows_layout(&app.toolbar, &app.tabs, "startup");
+    }
+
+    event_loop.run(move |event, _, control_flow| {
+        if WIN_EXIT.load(Ordering::SeqCst) {
+            *control_flow = ControlFlow::Exit;
+        }
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
+        let app = win_app.as_mut();
+        dispatch_app_event(
+            event,
+            control_flow,
+            &app.window,
+            &app.toolbar,
+            Some(&app.devtools_panel),
+            &mut app.tabs,
+            &mut app.current,
+            &mut app.next_id,
+            &app.proxy,
+            &mut app.ww,
+            &mut app.wh,
+            &mut app.devtools_open,
+            &mut app.modifiers,
+            Some(&mut app.z_order_nudges),
+        );
+    });
+}
+
+
 fn main() {
     #[cfg(target_os = "windows")]
     init_windows_debug_log();
@@ -2382,6 +2424,9 @@ fn main() {
 
     let window = build_window(&event_loop);
     set_dock_icon();
+
+    #[cfg(target_os = "windows")]
+    window.set_visible(false);
 
     let (mut ww, mut wh) = logical_size(&window);
 
@@ -2416,14 +2461,31 @@ fn main() {
     let mut current: usize = 0;
 
     #[cfg(target_os = "windows")]
-    let mut z_order_nudges: u32 = 0;
+    {
+        run_windows_app(
+            event_loop,
+            WindowsRunState {
+                window,
+                toolbar,
+                devtools_panel,
+                tabs,
+                current,
+                next_id,
+                ww,
+                wh,
+                devtools_open,
+                modifiers,
+                z_order_nudges: 0,
+                proxy,
+            },
+        );
+        return;
+    }
 
     raise_toolbar(
         &toolbar,
         &window,
         Some(&tabs),
-        #[cfg(target_os = "windows")]
-        Some(&devtools_panel),
     );
 
     resize_all(
@@ -2433,71 +2495,9 @@ fn main() {
         ww,
         wh,
         devtools_open,
-        #[cfg(target_os = "windows")]
-        Some(&devtools_panel),
     );
 
     sync_toolbar(&toolbar, &tabs, current);
-
-    #[cfg(target_os = "windows")]
-    log_windows_layout(&toolbar, &tabs, "startup");
-
-    #[cfg(target_os = "windows")]
-    {
-        let mut win_app = Box::new(WindowsRunState {
-            window,
-            toolbar,
-            devtools_panel,
-            tabs,
-            current,
-            next_id,
-            ww,
-            wh,
-            devtools_open,
-            modifiers,
-            z_order_nudges: 0,
-            proxy,
-        });
-        {
-            let app = win_app.as_mut();
-            install_win_ipc_host(
-                &app.window,
-                &app.toolbar,
-                &mut app.tabs,
-                &mut app.current,
-                &mut app.next_id,
-                &app.proxy,
-                &mut app.ww,
-                &mut app.wh,
-                &mut app.devtools_open,
-                &app.devtools_panel,
-            );
-        }
-        event_loop.run(move |event, _, control_flow| {
-            if WIN_EXIT.load(Ordering::SeqCst) {
-                *control_flow = ControlFlow::Exit;
-            }
-            *control_flow =
-                ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
-            let app = win_app.as_mut();
-            dispatch_app_event(
-                event,
-                control_flow,
-                &app.window,
-                &app.toolbar,
-                Some(&app.devtools_panel),
-                &mut app.tabs,
-                &mut app.current,
-                &mut app.next_id,
-                &app.proxy,
-                &mut app.ww,
-                &mut app.wh,
-                &mut app.devtools_open,
-                &mut app.modifiers,
-                Some(&mut app.z_order_nudges),
-            );
-        });
-    }
 
     #[cfg(not(target_os = "windows"))]
     event_loop.run(move |event, _, control_flow| {
