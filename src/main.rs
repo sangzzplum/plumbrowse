@@ -1455,8 +1455,7 @@ fn build_content_webview(
 
     #[cfg(target_os = "windows")]
     let builder = builder
-        .with_browser_accelerator_keys(false)
-        .with_additional_browser_args("--remote-debugging-port=9222 --remote-allow-origins=*");
+        .with_browser_accelerator_keys(false);
 
     #[cfg(target_os = "windows")]
     let webview = if url == NEWTAB_URL {
@@ -1769,7 +1768,7 @@ fn open_new_tab(
 struct WindowsRunState {
     window: Window,
     toolbar: WebView,
-    devtools_panel: WebView,
+    devtools_panel: Option<WebView>,
     tabs: Vec<Tab>,
     current: usize,
     next_id: u32,
@@ -1779,6 +1778,7 @@ struct WindowsRunState {
     modifiers: ModifiersState,
     z_order_nudges: u32,
     proxy: EventLoopProxy<UserEvent>,
+    bootstrapped: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -1882,7 +1882,7 @@ fn dispatch_win_ipc(msg: &str) {
             ww: &mut app.ww,
             wh: &mut app.wh,
             devtools_open: &mut app.devtools_open,
-            devtools_panel: Some(&app.devtools_panel),
+            devtools_panel: app.devtools_panel.as_ref(),
         };
         process_ipc(msg, &mut ctx);
     }
@@ -2392,6 +2392,59 @@ fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
 
 
 #[cfg(target_os = "windows")]
+fn bootstrap_win_app(app: &mut WindowsRunState) {
+    if app.bootstrapped {
+        return;
+    }
+    app.bootstrapped = true;
+
+    win_startup("bootstrap: devtools panel");
+    app.devtools_panel = Some(build_devtools_panel(&app.window, app.ww, app.wh));
+
+    win_startup("bootstrap: content webview");
+    let webview = build_content_webview(
+        &app.window,
+        app.proxy.clone(),
+        1,
+        NEWTAB_URL,
+        app.ww,
+        app.wh,
+        true,
+        app.devtools_open,
+    );
+    app.tabs.push(Tab {
+        id: 1,
+        url: NEWTAB_URL.to_string(),
+        title: "Новая вкладка".to_string(),
+        webview,
+    });
+    app.current = 0;
+    app.next_id = 2;
+
+    app.window.set_visible(true);
+    raise_toolbar(
+        &app.toolbar,
+        &app.window,
+        Some(&app.tabs),
+        app.devtools_panel.as_ref(),
+    );
+    resize_all(
+        &app.window,
+        &app.toolbar,
+        &app.tabs,
+        app.ww,
+        app.wh,
+        app.devtools_open,
+        app.devtools_panel.as_ref(),
+    );
+    sync_toolbar(&app.toolbar, &app.tabs, app.current);
+    log_windows_layout(&app.toolbar, &app.tabs, "startup");
+    WIN_IPC_READY.store(true, Ordering::SeqCst);
+    drain_win_ipc_fallback();
+    log_windows_debug("bootstrap complete");
+}
+
+#[cfg(target_os = "windows")]
 fn run_windows_app(
     event_loop: tao::event_loop::EventLoop<UserEvent>,
     state: WindowsRunState,
@@ -2401,31 +2454,7 @@ fn run_windows_app(
     let app_ptr = WinAppPtr(raw);
     register_win_app(app_ptr);
 
-    unsafe {
-        let app = win_app_mut(app_ptr);
-        app.window.set_visible(true);
-        raise_toolbar(
-            &app.toolbar,
-            &app.window,
-            Some(&app.tabs),
-            Some(&app.devtools_panel),
-        );
-        resize_all(
-            &app.window,
-            &app.toolbar,
-            &app.tabs,
-            app.ww,
-            app.wh,
-            app.devtools_open,
-            Some(&app.devtools_panel),
-        );
-        sync_toolbar(&app.toolbar, &app.tabs, app.current);
-        log_windows_layout(&app.toolbar, &app.tabs, "startup");
-        WIN_IPC_READY.store(true, Ordering::SeqCst);
-        drain_win_ipc_fallback();
-        log_windows_debug("startup complete, entering event loop");
-    }
-
+    log_windows_debug("entering event loop");
     event_loop.run(move |event, _, control_flow| {
         if WIN_EXIT.load(Ordering::SeqCst) {
             *control_flow = ControlFlow::Exit;
@@ -2433,12 +2462,13 @@ fn run_windows_app(
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
         unsafe {
             let app = win_app_mut(app_ptr);
+            bootstrap_win_app(app);
             dispatch_app_event(
                 event,
                 control_flow,
                 &app.window,
                 &app.toolbar,
-                Some(&app.devtools_panel),
+                app.devtools_panel.as_ref(),
                 &mut app.tabs,
                 &mut app.current,
                 &mut app.next_id,
@@ -2465,12 +2495,6 @@ fn main() {
     win_startup("main begin");
 
     #[cfg(target_os = "windows")]
-    std::env::set_var(
-        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-        "--remote-debugging-port=9222 --remote-allow-origins=*",
-    );
-
-    #[cfg(target_os = "windows")]
     win_startup("creating event loop");
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -2494,16 +2518,33 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     win_startup("building toolbar");
-    // Windows: toolbar must be created before content webviews or HTML often stays blank (white bar).
     let toolbar = build_toolbar(&window, proxy.clone(), ww);
 
     #[cfg(target_os = "windows")]
-    win_startup("building devtools panel");
+    win_startup("entering run_windows_app");
     #[cfg(target_os = "windows")]
-    let devtools_panel = build_devtools_panel(&window, ww, wh);
+    {
+        run_windows_app(
+            event_loop,
+            WindowsRunState {
+                window,
+                toolbar,
+                devtools_panel: None,
+                tabs: vec![],
+                current: 0,
+                next_id: 1,
+                ww,
+                wh,
+                devtools_open,
+                modifiers,
+                z_order_nudges: 0,
+                proxy,
+                bootstrapped: false,
+            },
+        );
+        return;
+    }
 
-    #[cfg(target_os = "windows")]
-    win_startup("building content webview");
     let first_webview = build_content_webview(
         &window,
         proxy.clone(),
@@ -2525,30 +2566,6 @@ fn main() {
     }];
     #[cfg_attr(target_os = "windows", allow(unused_mut))]
     let mut current: usize = 0;
-
-    #[cfg(target_os = "windows")]
-    win_startup("entering run_windows_app");
-    #[cfg(target_os = "windows")]
-    {
-        run_windows_app(
-            event_loop,
-            WindowsRunState {
-                window,
-                toolbar,
-                devtools_panel,
-                tabs,
-                current,
-                next_id,
-                ww,
-                wh,
-                devtools_open,
-                modifiers,
-                z_order_nudges: 0,
-                proxy,
-            },
-        );
-        return;
-    }
 
     #[cfg(not(target_os = "windows"))]
     {
