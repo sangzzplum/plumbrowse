@@ -1,10 +1,10 @@
 //! PlumBrowser — лёгкий кросс-платформенный браузер на Rust.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-#[cfg(not(target_os = "windows"))]
 use serde_json::json;
 use std::borrow::Cow;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 use std::cell::UnsafeCell;
@@ -521,6 +521,7 @@ struct Tab {
     id: u32,
     url: String,
     title: String,
+    loading: bool,
     webview: WebView,
 }
 
@@ -534,6 +535,9 @@ enum UserEvent {
     TitleChanged { tab_id: u32, title: String },
     NewWindow { url: String },
     FocusTab { tab_id: u32 },
+    LoadStarted { tab_id: u32 },
+    LoadFinished { tab_id: u32 },
+    ForceLoad { tab_id: u32, url: String },
 }
 
 /// Windows toolbar is re-rendered from Rust (WebView2 often won't run toolbar JS / evaluate_script).
@@ -544,6 +548,7 @@ struct ToolbarSnapshot {
     urls: Vec<String>,
     current: usize,
     cur_url: String,
+    loading: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -553,7 +558,8 @@ impl ToolbarSnapshot {
             titles: vec!["Новая вкладка".to_string()],
             urls: vec![NEWTAB_URL.to_string()],
             current: 0,
-            cur_url: NEWTAB_URL.to_string(),
+            cur_url: String::new(),
+            loading: false,
         }
     }
 }
@@ -652,6 +658,15 @@ fn resolve_omnibox_input(input: &str) -> Option<String> {
         return None;
     }
 
+    let lower = u.to_lowercase();
+    if lower == "plum.newtab"
+        || lower == "plum://newtab"
+        || lower.starts_with("http://plum.newtab")
+        || lower.starts_with("https://plum.newtab")
+    {
+        return Some(NEWTAB_URL.to_string());
+    }
+
     if u.starts_with("http://")
         || u.starts_with("https://")
         || u.starts_with("file://")
@@ -671,7 +686,8 @@ fn resolve_omnibox_input(input: &str) -> Option<String> {
     // Heuristic: looks like a host if it contains a dot.
     let looks_like_host = u.contains('.') && !u.starts_with('.') && !u.ends_with('.');
     if looks_like_host {
-        return Some(format!("https://{u}"));
+        // Prefer HTTP first — many sites redirect to HTTPS themselves.
+        return Some(format!("http://{u}"));
     }
 
     // Otherwise search.
@@ -679,6 +695,112 @@ fn resolve_omnibox_input(input: &str) -> Option<String> {
         "https://www.google.com/search?q={}",
         percent_encode_query(u)
     ))
+}
+
+fn is_internal_newtab_url(url: &str) -> bool {
+    let u = url.trim();
+    if u.is_empty() || u == "about:blank" || u.starts_with("data:text/html") {
+        return true;
+    }
+    if u == NEWTAB_URL || u.starts_with("plum://newtab") {
+        return true;
+    }
+    let lower = u.to_lowercase();
+    lower == "plum.newtab"
+        || lower.starts_with("http://plum.newtab")
+        || lower.starts_with("https://plum.newtab")
+}
+
+fn is_blocked_plum_http_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    if !(lower.starts_with("http://plum.") || lower.starts_with("https://plum.")) {
+        return false;
+    }
+    !lower.contains("plum.toolbar") && !lower.contains("plum.ipc")
+}
+
+/// Canonical URL stored in tab state.
+fn logical_tab_url(url: &str) -> String {
+    if is_internal_newtab_url(url) {
+        NEWTAB_URL.to_string()
+    } else {
+        url.to_string()
+    }
+}
+
+/// What we show in the omnibox (new tab page shows empty, like Chrome).
+fn omnibox_display_url(url: &str) -> String {
+    if is_internal_newtab_url(url) {
+        String::new()
+    } else {
+        url.to_string()
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn browser_icon_data_url() -> String {
+    static ICON: OnceLock<String> = OnceLock::new();
+    ICON.get_or_init(|| {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/plumnet.png");
+        std::fs::read(&path)
+            .map(|bytes| format!("data:image/png;base64,{}", base64_encode(&bytes)))
+            .unwrap_or_else(|_| String::new())
+    })
+    .clone()
+}
+
+fn tab_favicon_url(page_url: &str) -> String {
+    if is_internal_newtab_url(page_url) {
+        return browser_icon_data_url();
+    }
+    let rest = page_url
+        .strip_prefix("https://")
+        .or_else(|| page_url.strip_prefix("http://"));
+    if let Some(rest) = rest {
+        if let Some(host) = rest.split('/').next() {
+            if !host.is_empty() {
+                return format!("http://{host}/favicon.ico");
+            }
+        }
+    }
+    browser_icon_data_url()
+}
+
+fn webview_stop(webview: &WebView) {
+    #[cfg(target_os = "macos")]
+    {
+        use wry::WebViewExtMacOS;
+        unsafe {
+            webview.webview().stopLoading();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = webview.evaluate_script("window.stop()");
+    }
 }
 
 fn bounds_toolbar(win_w: f64) -> Rect {
@@ -725,30 +847,20 @@ fn tab_label(tab: &Tab) -> String {
 }
 
 /// Keep logical URLs in tab state and the omnibox (never show data: document URLs).
-fn logical_tab_url(url: &str) -> String {
-    if url == NEWTAB_URL
-        || url.starts_with("data:text/html")
-        || url == "about:blank"
-        || url.is_empty()
-    {
-        NEWTAB_URL.to_string()
-    } else {
-        url.to_string()
-    }
-}
-
 fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
     let titles: Vec<String> = tabs.iter().map(tab_label).collect();
-    let urls: Vec<String> = tabs.iter().map(|t| t.url.clone()).collect();
-    let cur_url = tabs
-        .get(current)
-        .map(|t| t.url.clone())
-        .unwrap_or_default();
 
     #[cfg(target_os = "windows")]
     {
-        let cur_url = logical_tab_url(&cur_url);
-        let urls: Vec<String> = urls.iter().map(|u| logical_tab_url(u)).collect();
+        let loading = tabs.get(current).map(|t| t.loading).unwrap_or(false);
+        let cur_url = tabs
+            .get(current)
+            .map(|t| omnibox_display_url(&t.url))
+            .unwrap_or_default();
+        let urls: Vec<String> = tabs
+            .iter()
+            .map(|t| omnibox_display_url(&logical_tab_url(&t.url)))
+            .collect();
         {
             let mut snap = toolbar_snapshot()
                 .lock()
@@ -757,13 +869,24 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
             snap.urls = urls;
             snap.current = current;
             snap.cur_url = cur_url;
+            snap.loading = loading;
         }
         TOOLBAR_DIRTY.store(true, Ordering::SeqCst);
         return;
     }
 
     #[cfg(not(target_os = "windows"))]
-    let cur_url = tabs.get(current).map(|t| t.url.as_str()).unwrap_or("");
+    let urls: Vec<String> = tabs
+        .iter()
+        .map(|t| omnibox_display_url(&logical_tab_url(&t.url)))
+        .collect();
+    #[cfg(not(target_os = "windows"))]
+    let cur_url = tabs
+        .get(current)
+        .map(|t| omnibox_display_url(&t.url))
+        .unwrap_or_default();
+    #[cfg(not(target_os = "windows"))]
+    let loading = tabs.get(current).map(|t| t.loading).unwrap_or(false);
 
     #[cfg(not(target_os = "windows"))]
     let script = format!(
@@ -772,15 +895,16 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
   var urls = {urls};
   var cur = {current};
   var url = {cur_url};
+  var loading = {loading};
   function apply() {{
     if (typeof window.__setState === 'function') {{
-      window.__setState(titles, urls, cur, url);
+      window.__setState(titles, urls, cur, url, loading);
       return true;
     }}
     return false;
   }}
   if (!apply()) {{
-    window.__pendingState = [titles, urls, cur, url];
+    window.__pendingState = [titles, urls, cur, url, loading];
     var tries = 0;
     (function retry() {{
       if (apply() || ++tries > 120) return;
@@ -791,7 +915,8 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
         titles = json!(titles),
         urls = json!(urls),
         current = current,
-        cur_url = json!(cur_url)
+        cur_url = json!(cur_url),
+        loading = json!(loading)
     );
     #[cfg(not(target_os = "windows"))]
     let _ = toolbar.evaluate_script(&script);
@@ -839,7 +964,7 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
     }
 
     let (mime, body): (&str, Cow<'static, [u8]>) = match path {
-        "/newtab" | "/newtab/" | "/" if host.is_empty() || host == "newtab" => (
+        "/newtab" | "/newtab/" | "/" if host.is_empty() || host == "newtab" || host == "plum.newtab" => (
             "text/html; charset=utf-8",
             Cow::Borrowed(NEWTAB_HTML.as_bytes()),
         ),
@@ -887,36 +1012,40 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
 
 const TOOLBAR_SCRIPT: &str = r#"
     function post(msg) {
-      // Navigation IPC is reliable on WebView2 toolbars; postMessage often exists but is a no-op.
       try {
-        window.location.replace('plum://ipc/' + encodeURIComponent(msg));
+        if (window.ipc && window.ipc.postMessage) {
+          window.ipc.postMessage(msg);
+          return;
+        }
       } catch (e) {}
       try {
         if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
           window.chrome.webview.postMessage(msg);
-        } else if (window.ipc && window.ipc.postMessage) {
-          window.ipc.postMessage(msg);
+          return;
         }
       } catch (e2) {}
+      try {
+        window.location.replace('plum://ipc/' + encodeURIComponent(msg));
+      } catch (e3) {}
+    }
+
+    function browserIconDataUrl() {
+      return window.__plumBrowserIcon || svgFallbackDataUrl();
     }
 
     function svgFallbackDataUrl() {
-      const svg =
-        '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24">' +
-        '<circle cx="12" cy="12" r="9.4" fill="none" stroke="rgba(232,234,237,0.85)" stroke-width="1.6"/>' +
-        '<path d="M2.8 12h18.4" fill="none" stroke="rgba(154,160,166,0.85)" stroke-width="1.2"/>' +
-        '<path d="M12 2.8c2.6 2.6 4.1 6 4.1 9.2s-1.5 6.6-4.1 9.2c-2.6-2.6-4.1-6-4.1-9.2S9.4 5.4 12 2.8Z" fill="none" stroke="rgba(154,160,166,0.85)" stroke-width="1.2"/>' +
-        '</svg>';
-      return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+      return browserIconDataUrl();
     }
 
     function faviconUrl(pageUrl) {
+      if (!pageUrl || pageUrl.includes('plum.newtab') || pageUrl.startsWith('plum://') || pageUrl.startsWith('data:')) {
+        return browserIconDataUrl();
+      }
       try {
         const u = new URL(pageUrl);
-        // simplest "real" favicon path; many sites still serve it
         return u.origin + '/favicon.ico';
       } catch (e) {
-        return svgFallbackDataUrl();
+        return browserIconDataUrl();
       }
     }
 
@@ -958,7 +1087,11 @@ const TOOLBAR_SCRIPT: &str = r#"
 
       bindBtn('back', () => post('nav_back'));
       bindBtn('forward', () => post('nav_forward'));
-      bindBtn('reload', () => post('nav_reload'));
+      bindBtn('reload', () => {
+        const btn = document.getElementById('reload');
+        const loading = btn && btn.dataset.loading === '1';
+        post(loading ? 'nav_stop' : 'nav_reload');
+      });
       bindBtn('devtools', () => post('nav_devtools'));
 
       const urlInput = document.getElementById('url');
@@ -976,7 +1109,7 @@ const TOOLBAR_SCRIPT: &str = r#"
       initToolbar();
       if (window.__pendingState && typeof window.__setState === 'function') {
         const pending = window.__pendingState;
-        window.__setState(pending[0], pending[1], pending[2], pending[3]);
+        window.__setState(pending[0], pending[1], pending[2], pending[3], pending[4] || false);
         delete window.__pendingState;
       }
     }
@@ -1039,7 +1172,7 @@ const TOOLBAR_SCRIPT: &str = r#"
 
     window.addEventListener('resize', () => layoutTabs());
 
-    window.__setState = function(tabTitles, tabUrls, current, url) {
+    window.__setState = function(tabTitles, tabUrls, current, url, loading) {
       const strip = document.getElementById('tab-strip');
       if (!strip) return;
       strip.innerHTML = '';
@@ -1055,7 +1188,7 @@ const TOOLBAR_SCRIPT: &str = r#"
         icon.referrerPolicy = 'no-referrer';
         icon.loading = 'lazy';
         icon.decoding = 'async';
-        icon.onerror = () => { icon.onerror = null; icon.src = svgFallbackDataUrl(); };
+        icon.onerror = () => { icon.onerror = null; icon.src = browserIconDataUrl(); };
 
         const tt = document.createElement('div');
         tt.className = 'tab-title';
@@ -1074,6 +1207,12 @@ const TOOLBAR_SCRIPT: &str = r#"
 
       const urlEl = document.getElementById('url');
       if (urlEl) urlEl.value = url || '';
+      const reloadBtn = document.getElementById('reload');
+      if (reloadBtn) {
+        reloadBtn.dataset.loading = loading ? '1' : '0';
+        reloadBtn.textContent = loading ? '✕' : '↻';
+        reloadBtn.title = loading ? 'Остановить загрузку' : 'Обновить';
+      }
       layoutTabs();
     };
 
@@ -1172,10 +1311,15 @@ fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
     for (i, title) in snap.titles.iter().enumerate() {
         let active = if i == snap.current { " active" } else { "" };
         let title_esc = html_escape(title);
+        let page_url = snap.urls.get(i).map(String::as_str).unwrap_or("");
+        let icon_url = html_escape(&tab_favicon_url(page_url));
         let switch = ipc_nav_url(&format!("switch_tab:{i}"));
         let close = ipc_nav_url(&format!("close_tab:{i}"));
         tabs_html.push_str(&format!(
             r#"<div class="tab{active}" onclick="window.location.replace('{switch}')">"#
+        ));
+        tabs_html.push_str(&format!(
+            r#"<img class="tab-icon" src="{icon_url}" alt="" referrerpolicy="no-referrer" />"#
         ));
         tabs_html.push_str(&format!(
             r#"<div class="tab-title">{title_esc}</div>"#
@@ -1192,7 +1336,11 @@ fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
     let win_close = ipc_nav_url("win_close");
     let nav_back = ipc_nav_url("nav_back");
     let nav_forward = ipc_nav_url("nav_forward");
-    let nav_reload = ipc_nav_url("nav_reload");
+    let (nav_reload_label, nav_reload_title, nav_reload_action) = if snap.loading {
+        ("✕", "Остановить загрузку", ipc_nav_url("nav_stop"))
+    } else {
+        ("↻", "Обновить", ipc_nav_url("nav_reload"))
+    };
     let nav_devtools = ipc_nav_url("nav_devtools");
 
     format!(
@@ -1246,6 +1394,7 @@ fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
       cursor:pointer; user-select:none; box-sizing:border-box; color:var(--fg);
     }}
     .tab.active {{ background:var(--b2); }}
+    .tab-icon {{ flex:0 0 auto; width:16px; height:16px; border-radius:4px; display:block; }}
     .tab-title {{ min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; flex:1 1 auto; }}
     .tab-close {{
       position:absolute; right:6px; top:4px;
@@ -1272,7 +1421,7 @@ fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
       <div class="row">
         <div class="navbtn" title="Назад" onclick="window.location.replace('{nav_back}')">←</div>
         <div class="navbtn" title="Вперёд" onclick="window.location.replace('{nav_forward}')">→</div>
-        <div class="navbtn" title="Обновить" onclick="window.location.replace('{nav_reload}')">↻</div>
+        <div class="navbtn" title="{nav_reload_title}" onclick="window.location.replace('{nav_reload_action}')">{nav_reload_label}</div>
         <div class="navbtn" title="Инструменты разработчика (F12)" onclick="window.location.replace('{nav_devtools}')">&#123; &#125;</div>
         <input id="url" value="{cur_url_attr}" placeholder="адрес или поиск" autocomplete="off" spellcheck="false"
           onkeydown="if(event.key==='Enter')window.location.replace('plum://ipc/load:'+encodeURIComponent(this.value))" />
@@ -1345,11 +1494,13 @@ fn toolbar_html() -> String {
       <div class="go" id="go">Go</div>
     </div>
   </div>
+  <script>window.__plumBrowserIcon={browser_icon};</script>
   <script>{script}</script>
 </body>
 </html>"#,
             script = TOOLBAR_SCRIPT,
-            tab_bar_css = TAB_BAR_CSS
+            tab_bar_css = TAB_BAR_CSS,
+            browser_icon = json!(browser_icon_data_url()),
         );
     }
 
@@ -1425,12 +1576,14 @@ fn toolbar_html() -> String {
       </div>
     </div>
   </div>
+  <script>window.__plumBrowserIcon={browser_icon};</script>
   <script>{script}</script>
 </body>
 </html>"#,
         script = TOOLBAR_SCRIPT,
         tab_bar_css = format!("{TAB_BAR_CSS}\n{WINDOWS_TAB_BAR_CSS}"),
         version = version_label(),
+        browser_icon = json!(browser_icon_data_url()),
     )
 }
 
@@ -1471,14 +1624,29 @@ fn build_content_webview(
         .with_on_page_load_handler({
             let proxy = proxy.clone();
             move |event, _| {
-                if matches!(event, PageLoadEvent::Finished) {
-                    let _ = proxy.send_event(UserEvent::FocusTab { tab_id });
+                match event {
+                    PageLoadEvent::Started => {
+                        let _ = proxy.send_event(UserEvent::LoadStarted { tab_id });
+                    }
+                    PageLoadEvent::Finished => {
+                        let _ = proxy.send_event(UserEvent::LoadFinished { tab_id });
+                        let _ = proxy.send_event(UserEvent::FocusTab { tab_id });
+                    }
                 }
             }
         })
         .with_navigation_handler({
             let proxy = proxy.clone();
             move |nav_url| {
+                if is_blocked_plum_http_url(&nav_url)
+                    || (is_internal_newtab_url(&nav_url) && !nav_url.starts_with("plum://"))
+                {
+                    let _ = proxy.send_event(UserEvent::ForceLoad {
+                        tab_id,
+                        url: NEWTAB_URL.to_string(),
+                    });
+                    return false;
+                }
                 let _ = proxy.send_event(UserEvent::Navigated {
                     tab_id,
                     url: nav_url,
@@ -1795,6 +1963,7 @@ fn open_new_tab(
         id: tab_id,
         url: logical_tab_url(url),
         title,
+        loading: false,
         webview,
     });
     *current = tabs.len() - 1;
@@ -2189,6 +2358,14 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
         }
         "nav_reload" => {
             let _ = ctx.tabs[*ctx.current].webview.reload();
+            ctx.tabs[*ctx.current].loading = true;
+            sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
+            focus_active_tab(ctx.tabs, *ctx.current);
+        }
+        "nav_stop" => {
+            ctx.tabs[*ctx.current].loading = false;
+            webview_stop(&ctx.tabs[*ctx.current].webview);
+            sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
             focus_active_tab(ctx.tabs, *ctx.current);
         }
         "nav_devtools" => {
@@ -2207,8 +2384,10 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
         _ if msg.starts_with("load:") => {
             if let Some(rest) = msg.strip_prefix("load:") {
                 if let Some(url) = resolve_omnibox_input(rest) {
+                    let url = logical_tab_url(&url);
                     ctx.tabs[*ctx.current].url = url.clone();
                     ctx.tabs[*ctx.current].title.clear();
+                    ctx.tabs[*ctx.current].loading = true;
                     #[cfg(target_os = "windows")]
                     content_load_url(&ctx.tabs[*ctx.current].webview, &url);
                     #[cfg(not(target_os = "windows"))]
@@ -2450,25 +2629,46 @@ fn dispatch_app_event(
                 return;
             }
             if let Some(idx) = find_tab_idx(tabs, tab_id) {
-                #[cfg(target_os = "windows")]
-                let url = logical_tab_url(&url);
-                tabs[idx].url = url;
+                tabs[idx].url = logical_tab_url(&url);
                 if idx == *current {
                     sync_toolbar(toolbar, tabs, *current);
                     focus_active_tab(tabs, *current);
                 } else {
-                    #[cfg(target_os = "windows")]
                     sync_toolbar(toolbar, tabs, *current);
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        let titles = tabs.iter().map(tab_label).collect::<Vec<_>>();
-                        let script = format!(
-                            "window.__setTabTitle({}, {});",
-                            idx,
-                            json!(titles[idx])
-                        );
-                        let _ = toolbar.evaluate_script(&script);
-                    }
+                }
+            }
+        }
+
+        Event::UserEvent(UserEvent::LoadStarted { tab_id }) => {
+            if let Some(idx) = find_tab_idx(tabs, tab_id) {
+                tabs[idx].loading = true;
+                if idx == *current {
+                    sync_toolbar(toolbar, tabs, *current);
+                }
+            }
+        }
+
+        Event::UserEvent(UserEvent::LoadFinished { tab_id }) => {
+            if let Some(idx) = find_tab_idx(tabs, tab_id) {
+                tabs[idx].loading = false;
+                if idx == *current {
+                    sync_toolbar(toolbar, tabs, *current);
+                }
+            }
+        }
+
+        Event::UserEvent(UserEvent::ForceLoad { tab_id, url }) => {
+            if let Some(idx) = find_tab_idx(tabs, tab_id) {
+                let url = logical_tab_url(&url);
+                tabs[idx].url = url.clone();
+                tabs[idx].title.clear();
+                tabs[idx].loading = true;
+                #[cfg(target_os = "windows")]
+                content_load_url(&tabs[idx].webview, &url);
+                #[cfg(not(target_os = "windows"))]
+                let _ = tabs[idx].webview.load_url(&url);
+                if idx == *current {
+                    sync_toolbar(toolbar, tabs, *current);
                 }
             }
         }
@@ -2610,6 +2810,7 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
                 id: 1,
                 url: NEWTAB_URL.to_string(),
                 title: "Новая вкладка".to_string(),
+                loading: false,
                 webview,
             });
             app.current = 0;
@@ -2793,6 +2994,7 @@ fn main() {
         id: 1,
         url: NEWTAB_URL.to_string(),
         title: "Новая вкладка".to_string(),
+        loading: false,
         webview: first_webview,
     }];
     #[cfg_attr(target_os = "windows", allow(unused_mut))]
