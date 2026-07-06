@@ -60,27 +60,10 @@ fn raise_toolbar(toolbar: &WebView, window: &Window) {
 
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        };
+        use tao::platform::windows::WindowExtWindows;
+        use wry::WebViewExtWindows;
 
-        let controller = toolbar.controller();
-        unsafe {
-            let mut hwnd = HWND::default();
-            if controller.ParentWindow(&mut hwnd).is_ok() {
-                let _ = SetWindowPos(
-                    hwnd,
-                    HWND_TOP,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
-        }
-        let _ = window;
+        let _ = toolbar.reparent(window.hwnd());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
