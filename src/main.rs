@@ -39,10 +39,22 @@ fn toolbar_height() -> f64 {
     if cfg!(target_os = "macos") {
         118.0
     } else if cfg!(target_os = "windows") {
-        // Native title bar — only tabs + nav row (no custom titlebar HTML).
-        108.0
+        152.0
     } else {
         152.0
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn log_windows_ipc(msg: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("plumbrowser_debug.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "ipc: {msg}");
     }
 }
 
@@ -188,6 +200,7 @@ fn raise_toolbar(
         if let Some(tabs) = tabs {
             sync_windows_z_order(toolbar, tabs, devtools_panel);
         }
+        let _ = toolbar.focus();
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -421,6 +434,41 @@ fn percent_encode_query(s: &str) -> String {
     out
 }
 
+fn percent_decode_component(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Toolbar IPC via navigation (WebView2 custom-scheme pages often lack postMessage).
+fn toolbar_ipc_from_url(url: &str) -> Option<String> {
+    for prefix in [
+        "plum://ipc/",
+        "http://plum.ipc/",
+        "https://plum.ipc/",
+    ] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            return Some(percent_decode_component(rest));
+        }
+    }
+    None
+}
+
 fn resolve_omnibox_input(input: &str) -> Option<String> {
     let u = input.trim();
     if u.is_empty() {
@@ -615,8 +663,13 @@ const TOOLBAR_SCRIPT: &str = r#"
         }
         if (window.ipc && window.ipc.postMessage) {
           window.ipc.postMessage(msg);
+          return;
         }
       } catch (e) {}
+      // WebView2 + custom scheme (plum://toolbar): postMessage often missing — use navigation IPC.
+      try {
+        window.location.replace('plum://ipc/' + encodeURIComponent(msg));
+      } catch (e2) {}
     }
 
     function svgFallbackDataUrl() {
@@ -954,13 +1007,26 @@ fn toolbar_html() -> String {
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
     :root {{
-      --bg:#202124; --fg:#e8eaed; --mut:#9aa0a6; --b:#303134; --b2:#3c4043;
-      --toolbarH:{toolbar_h}px;
+      --bg:#202124; --fg:#e8eaed; --mut:#9aa0a6; --b:#303134; --b2:#3c4043; --danger:#5b2b2b;
+      --toolbarH:{toolbar_h}px; --titlebarH:44px;
     }}
     * {{ box-sizing:border-box; }}
     html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#202124; }}
     body {{ background:var(--bg); color:var(--fg); font:14px/1.2 system-ui,"Segoe UI",Arial; }}
     .chrome {{ height:var(--toolbarH); display:flex; flex-direction:column; }}
+    .titlebar {{
+      height:var(--titlebarH); display:flex; align-items:center; gap:10px;
+      padding:0 12px; border-bottom:1px solid #2b2c2f;
+      user-select:none; -webkit-user-select:none;
+    }}
+    .drag {{ flex:1; height:100%; display:flex; align-items:center; color:var(--mut); font-weight:700; cursor:default; }}
+    .winbtns {{ display:flex; gap:8px; }}
+    .wbtn {{
+      width:40px; height:26px; border-radius:10px; background:var(--b);
+      display:grid; place-items:center; cursor:pointer; user-select:none;
+    }}
+    .wbtn:hover {{ background:var(--b2); }}
+    .wbtn.close {{ background:var(--danger); }}
     .toolbar {{ flex:1; display:flex; flex-direction:column; gap:8px; padding:8px 12px 10px; min-height:0; overflow:visible; }}
     .tabs-bar {{ flex-shrink:0; }}
     {tab_bar_css}
@@ -981,6 +1047,14 @@ fn toolbar_html() -> String {
 </head>
 <body>
   <div class="chrome">
+    <div class="titlebar">
+      <div class="drag" id="drag">{version}</div>
+      <div class="winbtns">
+        <div class="wbtn" id="min" title="Свернуть">—</div>
+        <div class="wbtn" id="max" title="Развернуть">□</div>
+        <div class="wbtn close" id="close" title="Закрыть">×</div>
+      </div>
+    </div>
     <div class="toolbar">
       <div class="tabs-bar">
         <div class="tab-strip" id="tab-strip"></div>
@@ -1002,6 +1076,7 @@ fn toolbar_html() -> String {
 </html>"#,
         script = TOOLBAR_SCRIPT,
         tab_bar_css = format!("{TAB_BAR_CSS}\n{WINDOWS_TAB_BAR_CSS}"),
+        version = version_label(),
     )
 }
 
@@ -1208,18 +1283,25 @@ fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
     let proxy_page = proxy.clone();
     let proxy_ipc = proxy.clone();
+    let proxy_nav = proxy.clone();
     let mut builder = WebViewBuilder::new()
         .with_bounds(bounds_toolbar(ww))
         .with_background_color(TOOLBAR_BG)
         .with_visible(true)
-        .with_focused(!cfg!(target_os = "windows"))
+        .with_focused(true)
         .with_accept_first_mouse(true)
         .with_devtools(false)
         .with_hotkeys_zoom(false)
         .with_back_forward_navigation_gestures(false)
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
         .with_initialization_script(TOOLBAR_LOCK_SCRIPT)
-        .with_navigation_handler(|url| toolbar_navigation_allowed(&url))
+        .with_navigation_handler(move |url| {
+            if let Some(msg) = toolbar_ipc_from_url(&url) {
+                let _ = proxy_nav.send_event(UserEvent::Ipc(msg));
+                return false;
+            }
+            toolbar_navigation_allowed(&url)
+        })
         .with_on_page_load_handler(move |event, _| {
             if matches!(event, PageLoadEvent::Finished) {
                 let _ = proxy_page.send_event(UserEvent::Ipc("ready".to_string()));
@@ -1368,7 +1450,7 @@ fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
 
     #[cfg(target_os = "windows")]
     {
-        builder = builder.with_decorations(true);
+        builder = builder.with_decorations(false);
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1617,7 +1699,10 @@ fn main() {
                 }
             }
 
-            Event::UserEvent(UserEvent::Ipc(msg)) => match msg.as_str() {
+            Event::UserEvent(UserEvent::Ipc(msg)) => {
+                #[cfg(target_os = "windows")]
+                log_windows_ipc(&msg);
+                match msg.as_str() {
                 "win_drag" => {
                     let _ = window.drag_window();
                 }
@@ -1793,6 +1878,7 @@ fn main() {
                 }
 
                 _ => {}
+                }
             },
 
             #[cfg(target_os = "windows")]
