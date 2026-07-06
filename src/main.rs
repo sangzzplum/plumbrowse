@@ -288,7 +288,12 @@ const TOOLBAR_LOCK_SCRIPT: &str = r#"
   document.addEventListener('dragstart', e => e.preventDefault(), true);
   document.addEventListener('click', e => {
     const link = e.target.closest('a[href]');
-    if (link) { e.preventDefault(); e.stopPropagation(); }
+    if (!link) return;
+    const href = link.getAttribute('href') || '';
+    // plum://ipc/* — настоящие команды тулбара (WebView2 ловит их через NavigationStarting).
+    if (href.startsWith('plum://ipc/') || href.includes('plum.ipc/')) return;
+    e.preventDefault();
+    e.stopPropagation();
   }, true);
   document.addEventListener('keydown', e => {
     const k = e.key.toLowerCase();
@@ -534,6 +539,15 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
     let _ = toolbar.evaluate_script(&script);
 }
 
+#[cfg(target_os = "windows")]
+fn nudge_toolbar_layout(toolbar: &WebView, ww: f64) {
+    // WebView2 иногда не принимает postMessage/клики, пока не случится relayout.
+    let mut shrunk = bounds_toolbar(ww);
+    shrunk.size.height = (shrunk.size.height - 1.0).max(1.0);
+    let _ = toolbar.set_bounds(shrunk);
+    let _ = toolbar.set_bounds(bounds_toolbar(ww));
+}
+
 fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
     let uri = req.uri();
     let host = uri.host().unwrap_or_default();
@@ -608,6 +622,12 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
 
 const TOOLBAR_SCRIPT: &str = r#"
     function post(msg) {
+      if (window.__PLUM_IPC_NAV) {
+        try {
+          window.location.href = 'plum://ipc/' + encodeURIComponent(msg);
+          return;
+        } catch (e) {}
+      }
       try {
         if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
           window.chrome.webview.postMessage(msg);
@@ -618,11 +638,6 @@ const TOOLBAR_SCRIPT: &str = r#"
           return;
         }
       } catch (e) {}
-      if (window.__PLUM_IPC_NAV) {
-        try {
-          window.location.href = 'plum://ipc/' + encodeURIComponent(msg);
-        } catch (e2) {}
-      }
     }
 
     function svgFallbackDataUrl() {
@@ -652,21 +667,24 @@ const TOOLBAR_SCRIPT: &str = r#"
       if (e.detail > 1 && !e.target.closest('input')) e.preventDefault();
     });
 
+    function bindBtn(id, fn) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const href = el.getAttribute && el.getAttribute('href');
+      if (href && href.startsWith('plum://ipc/')) return;
+      el.addEventListener('click', fn);
+    }
+
     function initToolbar() {
       const drag = document.getElementById('drag');
       if (drag) drag.addEventListener('pointerdown', () => post('win_drag'));
 
-      const min = document.getElementById('min');
-      const max = document.getElementById('max');
-      const close = document.getElementById('close');
-      if (min) min.addEventListener('click', () => post('win_min'));
-      if (max) max.addEventListener('click', () => post('win_max_toggle'));
-      if (close) close.addEventListener('click', () => post('win_close'));
+      bindBtn('min', () => post('win_min'));
+      bindBtn('max', () => post('win_max_toggle'));
+      bindBtn('close', () => post('win_close'));
 
-      const addInline = document.getElementById('addtab-inline');
-      if (addInline) addInline.addEventListener('click', () => post('new_tab:'));
-      const addFixed = document.getElementById('addtab-fixed');
-      if (addFixed) addFixed.addEventListener('click', () => post('new_tab:'));
+      bindBtn('addtab-inline', () => post('new_tab:'));
+      bindBtn('addtab-fixed', () => post('new_tab:'));
 
       const strip = document.getElementById('tab-strip');
       if (strip) {
@@ -681,19 +699,17 @@ const TOOLBAR_SCRIPT: &str = r#"
         }
       }
 
-      const back = document.getElementById('back');
-      if (back) back.addEventListener('click', () => post('nav_back'));
-      const forward = document.getElementById('forward');
-      if (forward) forward.addEventListener('click', () => post('nav_forward'));
-      const reload = document.getElementById('reload');
-      if (reload) reload.addEventListener('click', () => post('nav_reload'));
-      const devtoolsBtn = document.getElementById('devtools');
-      if (devtoolsBtn) devtoolsBtn.addEventListener('click', () => post('nav_devtools'));
+      bindBtn('back', () => post('nav_back'));
+      bindBtn('forward', () => post('nav_forward'));
+      bindBtn('reload', () => post('nav_reload'));
+      bindBtn('devtools', () => post('nav_devtools'));
 
       const urlInput = document.getElementById('url');
       const go = document.getElementById('go');
       if (go && urlInput) {
-        go.addEventListener('click', () => post('load:' + urlInput.value));
+        if (!go.getAttribute('href')?.startsWith('plum://ipc/')) {
+          go.addEventListener('click', () => post('load:' + urlInput.value));
+        }
         urlInput.addEventListener('keydown', (e) => {
           if (e.key === 'Enter') post('load:' + e.target.value);
         });
@@ -978,53 +994,56 @@ fn toolbar_html() -> String {
       padding:0 12px; border-bottom:1px solid #2b2c2f;
       user-select:none; -webkit-user-select:none;
     }}
-    .drag {{ flex:1; height:100%; display:flex; align-items:center; color:var(--mut); font-weight:700; -webkit-app-region:drag; }}
-    .winbtns {{ display:flex; gap:8px; -webkit-app-region:no-drag; }}
-    .wbtn {{ width:40px; height:26px; border-radius:10px; background:var(--b); display:grid; place-items:center; cursor:pointer; -webkit-app-region:no-drag; }}
-    .wbtn:hover {{ background:var(--b2); }}
-    .wbtn.close {{ background:var(--danger); }}
-    .toolbar {{ flex:1; display:flex; flex-direction:column; gap:8px; padding:8px 12px 10px; -webkit-app-region:no-drag; min-height:0; overflow:visible; }}
+    .drag {{ flex:1; height:100%; display:flex; align-items:center; color:var(--mut); font-weight:700; cursor:default; }}
+    .winbtns {{ display:flex; gap:8px; }}
+    .wbtn, a.wbtn {{
+      width:40px; height:26px; border-radius:10px; background:var(--b);
+      display:grid; place-items:center; cursor:pointer; text-decoration:none; color:inherit;
+    }}
+    .wbtn:hover, a.wbtn:hover {{ background:var(--b2); }}
+    .wbtn.close, a.wbtn.close {{ background:var(--danger); }}
+    .toolbar {{ flex:1; display:flex; flex-direction:column; gap:8px; padding:8px 12px 10px; min-height:0; overflow:visible; }}
     .tabs-bar {{ flex-shrink:0; }}
     {tab_bar_css}
-    .addtab, .tab, .navbtn, input, .go {{ -webkit-app-region:no-drag; }}
+    .navbtn, a.navbtn, .addtab, a.addtab, .go, a.go {{ text-decoration:none; color:inherit; }}
     .row {{ display:flex; gap:8px; align-items:center; }}
-    .navbtn {{
+    .navbtn, a.navbtn {{
       width:36px; height:36px; border-radius:12px; background:var(--b);
       display:grid; place-items:center; cursor:pointer; user-select:none;
       font-size:16px; flex:0 0 auto;
     }}
-    .navbtn:hover {{ background:var(--b2); }}
+    .navbtn:hover, a.navbtn:hover {{ background:var(--b2); }}
     input {{
       flex:1; min-width:200px; padding:10px 14px; border-radius:16px;
       border:1px solid #3c4043; outline:none; background:#111; color:var(--fg);
     }}
-    .go {{ padding:10px 14px; border-radius:16px; background:var(--b); cursor:pointer; user-select:none; flex:0 0 auto; }}
-    .go:hover {{ background:var(--b2); }}
+    .go, a.go {{ padding:10px 14px; border-radius:16px; background:var(--b); cursor:pointer; user-select:none; flex:0 0 auto; display:grid; place-items:center; }}
+    .go:hover, a.go:hover {{ background:var(--b2); }}
   </style>
 </head>
 <body>
   <div class="chrome">
     <div class="titlebar">
-      <div class="drag" id="drag" data-wry-drag-region>{version}</div>
+      <div class="drag" id="drag">{version}</div>
       <div class="winbtns">
-        <div class="wbtn" id="min" title="Свернуть" onclick="post('win_min')">—</div>
-        <div class="wbtn" id="max" title="Развернуть" onclick="post('win_max_toggle')">□</div>
-        <div class="wbtn close" id="close" title="Закрыть" onclick="post('win_close')">×</div>
+        <a class="wbtn" id="min" href="plum://ipc/win_min" title="Свернуть">—</a>
+        <a class="wbtn" id="max" href="plum://ipc/win_max_toggle" title="Развернуть">□</a>
+        <a class="wbtn close" id="close" href="plum://ipc/win_close" title="Закрыть">×</a>
       </div>
     </div>
     <div class="toolbar">
       <div class="tabs-bar">
         <div class="tab-strip" id="tab-strip"></div>
-        <div class="addtab" id="addtab-inline" title="Новая вкладка" onclick="post('new_tab:')">+</div>
-        <div class="addtab" id="addtab-fixed" title="Новая вкладка" style="display:none" onclick="post('new_tab:')">+</div>
+        <a class="addtab" id="addtab-inline" href="plum://ipc/new_tab%3A" title="Новая вкладка">+</a>
+        <a class="addtab" id="addtab-fixed" href="plum://ipc/new_tab%3A" title="Новая вкладка" style="display:none">+</a>
       </div>
       <div class="row">
-        <div class="navbtn" id="back" title="Назад" onclick="post('nav_back')">←</div>
-        <div class="navbtn" id="forward" title="Вперёд" onclick="post('nav_forward')">→</div>
-        <div class="navbtn" id="reload" title="Обновить" onclick="post('nav_reload')">↻</div>
-        <div class="navbtn" id="devtools" title="Инструменты разработчика (F12)" onclick="post('nav_devtools')">&#123; &#125;</div>
+        <a class="navbtn" id="back" href="plum://ipc/nav_back" title="Назад">←</a>
+        <a class="navbtn" id="forward" href="plum://ipc/nav_forward" title="Вперёд">→</a>
+        <a class="navbtn" id="reload" href="plum://ipc/nav_reload" title="Обновить">↻</a>
+        <a class="navbtn" id="devtools" href="plum://ipc/nav_devtools" title="Инструменты разработчика (F12)">&#123; &#125;</a>
         <input id="url" placeholder="адрес или поиск" autocomplete="off" spellcheck="false" />
-        <div class="go" id="go" onclick="post('load:' + document.getElementById('url').value)">Go</div>
+        <a class="go" id="go" href="javascript:void(0)" onclick="post('load:'+document.getElementById('url').value);return false;">Go</a>
       </div>
     </div>
   </div>
@@ -1238,7 +1257,6 @@ fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
 }
 
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
-    let html = toolbar_html();
     let proxy_page = proxy.clone();
     let proxy_ipc = proxy.clone();
     #[cfg(target_os = "windows")]
@@ -1265,8 +1283,11 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
 
     #[cfg(target_os = "windows")]
     {
+        // NavigateToString (with_html) → about:blank: postMessage и plum://ipc не работают.
+        // Грузим через plum://toolbar/ — нормальная навигация + custom protocol.
         builder = builder
-            .with_html(&html)
+            .with_url("plum://toolbar/")
+            .with_custom_protocol("plum".to_string(), plum_protocol)
             .with_default_context_menus(false)
             .with_browser_accelerator_keys(false)
             .with_navigation_handler(move |url| {
@@ -1274,12 +1295,13 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
                     let _ = proxy_nav.send_event(UserEvent::Ipc(msg));
                     return false;
                 }
-                !url.starts_with("http://") && !url.starts_with("https://")
+                toolbar_navigation_allowed(&url)
             });
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        let html = toolbar_html();
         builder = builder
             .with_html(&html)
             .with_navigation_handler(|url| toolbar_navigation_allowed(&url));
@@ -1685,7 +1707,18 @@ fn main() {
                 }
                 "win_close" => *control_flow = ControlFlow::Exit,
 
-                "ready" => sync_toolbar(&toolbar, &tabs, current),
+                "ready" => {
+                    #[cfg(target_os = "windows")]
+                    nudge_toolbar_layout(&toolbar, ww);
+                    sync_toolbar(&toolbar, &tabs, current);
+                    raise_toolbar(
+                        &toolbar,
+                        &window,
+                        Some(&tabs),
+                        #[cfg(target_os = "windows")]
+                        Some(&devtools_panel),
+                    );
+                }
 
                 "focus_content" => focus_active_tab(&tabs, current),
 
