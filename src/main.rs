@@ -356,10 +356,7 @@ fn webview_go_back(webview: &WebView) {
 }
 
 fn open_docked_devtools(webview: &WebView) {
-    #[cfg(not(target_os = "windows"))]
     webview.open_devtools();
-    #[cfg(target_os = "windows")]
-    let _ = webview;
 }
 
 fn close_docked_devtools(webview: &WebView) {
@@ -367,15 +364,6 @@ fn close_docked_devtools(webview: &WebView) {
     webview.close_devtools();
     #[cfg(target_os = "windows")]
     let _ = webview;
-}
-
-#[cfg(target_os = "windows")]
-fn sync_windows_devtools(panel: &WebView, tab: &Tab, open: bool) {
-    if open {
-        win_devtools::open_in_panel(panel, &tab.url);
-    } else {
-        win_devtools::close_panel(panel);
-    }
 }
 
 fn webview_go_forward(webview: &WebView) {
@@ -397,7 +385,6 @@ fn webview_go_forward(webview: &WebView) {
 }
 
 const NEWTAB_URL: &str = "plum://newtab";
-const DEVTOOLS_WIDTH: f64 = 420.0;
 const TOOLBAR_BG: RGBA = (32, 33, 36, 255);
 
 fn app_version() -> &'static str {
@@ -447,33 +434,36 @@ const TOOLBAR_LOCK_SCRIPT: &str = r#"
 "#;
 
 const CONTENT_SHORTCUT_SCRIPT: &str = r#"
+  function postDevtools() {
+    try {
+      if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+        window.chrome.webview.postMessage('toggle_devtools');
+      } else if (window.ipc && window.ipc.postMessage) {
+        window.ipc.postMessage('toggle_devtools');
+      }
+    } catch (e) {}
+  }
   document.addEventListener('keydown', e => {
     const k = e.key.toLowerCase();
     if (e.key === 'F12') {
       e.preventDefault();
       e.stopPropagation();
-      if (window.ipc && window.ipc.postMessage) window.ipc.postMessage('toggle_devtools');
+      postDevtools();
       return;
     }
     if (e.ctrlKey && e.shiftKey && k === 'i') {
       e.preventDefault();
       e.stopPropagation();
-      if (window.ipc && window.ipc.postMessage) window.ipc.postMessage('toggle_devtools');
+      postDevtools();
       return;
     }
     if (e.metaKey && e.altKey && k === 'i') {
       e.preventDefault();
       e.stopPropagation();
-      if (window.ipc && window.ipc.postMessage) window.ipc.postMessage('toggle_devtools');
+      postDevtools();
     }
   }, true);
 "#;
-
-#[cfg(target_os = "windows")]
-const DEVTOOLS_PANEL_HTML: &str = r#"<!doctype html>
-<html><head><meta charset="utf-8"/><style>
-  html,body{margin:0;height:100%;background:#1e1e1e;overflow:hidden}
-</style></head><body></body></html>"#;
 
 /// Сайты показывают «браузер устарел», если UA похож на старый WebView — подставляем актуальный Chrome.
 fn content_user_agent() -> &'static str {
@@ -658,26 +648,11 @@ fn bounds_toolbar(win_w: f64) -> Rect {
     }
 }
 
-fn bounds_content(win_w: f64, win_h: f64, devtools_open: bool) -> Rect {
+fn bounds_content(win_w: f64, win_h: f64, _devtools_open: bool) -> Rect {
     let h = toolbar_height();
-    let devtools_w = if devtools_open && cfg!(target_os = "windows") {
-        DEVTOOLS_WIDTH
-    } else {
-        0.0
-    };
     Rect {
         position: LogicalPosition::new(0.0, h).into(),
-        size: LogicalSize::new((win_w - devtools_w).max(1.0), (win_h - h).max(1.0)).into(),
-    }
-}
-
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn bounds_devtools_panel(win_w: f64, win_h: f64) -> Rect {
-    let h = toolbar_height();
-    let content_w = (win_w - DEVTOOLS_WIDTH).max(1.0);
-    Rect {
-        position: LogicalPosition::new(content_w, h).into(),
-        size: LogicalSize::new(DEVTOOLS_WIDTH, (win_h - h).max(1.0)).into(),
+        size: LogicalSize::new(win_w.max(1.0), (win_h - h).max(1.0)).into(),
     }
 }
 
@@ -1420,7 +1395,7 @@ fn build_content_webview(
         .with_focused(if cfg!(target_os = "windows") { false } else { visible })
         .with_clipboard(true)
         .with_back_forward_navigation_gestures(true)
-        .with_devtools(!cfg!(target_os = "windows"))
+        .with_devtools(true)
         .with_hotkeys_zoom(true)
         .with_initialization_script(CONTENT_SHORTCUT_SCRIPT)
         .with_custom_protocol("plum".to_string(), plum_protocol)
@@ -1511,10 +1486,6 @@ fn show_tab(
     if devtools_open {
         if let Some(tab) = tabs.get(current) {
             open_docked_devtools(&tab.webview);
-            #[cfg(target_os = "windows")]
-            if let Some(panel) = devtools_panel {
-                sync_windows_devtools(panel, tab, true);
-            }
         }
     }
     focus_active_tab(tabs, current);
@@ -1541,11 +1512,6 @@ fn resize_all(
     let bounds = bounds_content(ww, wh, devtools_open);
     for tab in tabs {
         let _ = tab.webview.set_bounds(bounds);
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(panel) = devtools_panel {
-        let _ = panel.set_bounds(bounds_devtools_panel(ww, wh));
-        let _ = panel.set_visible(devtools_open);
     }
     #[cfg(target_os = "windows")]
     sync_windows_z_order(toolbar, tabs, devtools_panel);
@@ -1578,20 +1544,27 @@ fn toggle_devtools(
         return;
     };
 
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (
+            window,
+            toolbar,
+            devtools_open,
+            ww,
+            wh,
+            devtools_panel,
+        );
+        log_windows_debug("devtools: OpenDevToolsWindow");
+        tab.webview.open_devtools();
+        return;
+    }
+
     if *devtools_open {
         close_docked_devtools(&tab.webview);
-        #[cfg(target_os = "windows")]
-        if let Some(panel) = devtools_panel {
-            sync_windows_devtools(panel, tab, false);
-        }
         *devtools_open = false;
     } else {
         *devtools_open = true;
         open_docked_devtools(&tab.webview);
-        #[cfg(target_os = "windows")]
-        if let Some(panel) = devtools_panel {
-            sync_windows_devtools(panel, tab, true);
-        }
     }
 
     resize_all(
@@ -1685,25 +1658,6 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
     toolbar
 }
 
-#[cfg(target_os = "windows")]
-fn build_devtools_panel(window: &Window, ww: f64, wh: f64) -> WebView {
-    WebViewBuilder::new()
-        .with_html(DEVTOOLS_PANEL_HTML)
-        .with_bounds(bounds_devtools_panel(ww, wh))
-        .with_background_color((30, 30, 30, 255))
-        .with_visible(false)
-        .with_devtools(false)
-        .with_hotkeys_zoom(false)
-        .with_navigation_handler(|url| {
-            url.starts_with("http://127.0.0.1:9222") || url.starts_with("about:")
-        })
-        .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-        .with_default_context_menus(false)
-        .with_browser_accelerator_keys(false)
-        .build_as_child(window)
-        .expect("failed to build devtools panel")
-}
-
 fn open_new_tab(
     window: &Window,
     proxy: &EventLoopProxy<UserEvent>,
@@ -1749,10 +1703,6 @@ fn open_new_tab(
     *current = tabs.len() - 1;
     if devtools_open {
         open_docked_devtools(&tabs[*current].webview);
-        #[cfg(target_os = "windows")]
-        if let Some(panel) = devtools_panel {
-            sync_windows_devtools(panel, &tabs[*current], true);
-        }
     }
     sync_toolbar(toolbar, tabs, *current);
     resize_all(
@@ -2390,9 +2340,6 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
     }
     app.bootstrapped = true;
 
-    win_startup("bootstrap: devtools panel");
-    app.devtools_panel = Some(build_devtools_panel(&app.window, app.ww, app.wh));
-
     win_startup("bootstrap: content webview");
     let webview = build_content_webview(
         &app.window,
@@ -2603,97 +2550,5 @@ fn main() {
                 None,
             );
         });
-    }
-}
-
-
-#[cfg(target_os = "windows")]
-mod win_devtools {
-    use serde_json::Value;
-    use wry::WebView;
-
-    const CDP_BASE: &str = "http://127.0.0.1:9222";
-
-    pub fn open_in_panel(panel: &WebView, page_url: &str) {
-        for _ in 0..50 {
-            if let Some(url) = inspector_url_for_page(page_url) {
-                let _ = panel.set_visible(true);
-                let _ = panel.load_url(&url);
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        let _ = panel.set_visible(true);
-    }
-
-    pub fn close_panel(panel: &WebView) {
-        let _ = panel.set_visible(false);
-        let _ = panel.load_url("about:blank");
-    }
-
-    fn inspector_url_for_page(page_url: &str) -> Option<String> {
-        let targets = fetch_targets()?;
-        pick_target(&targets, page_url).and_then(|target| {
-            if let Some(path) = target.get("devtoolsFrontendUrl").and_then(|v| v.as_str()) {
-                return Some(frontend_url(path));
-            }
-            let ws = target.get("webSocketDebuggerUrl")?.as_str()?;
-            Some(format!(
-                "{CDP_BASE}/devtools/inspector.html?ws={}",
-                ws.trim_start_matches("ws://")
-            ))
-        })
-    }
-
-    fn frontend_url(path: &str) -> String {
-        if path.starts_with("http://") || path.starts_with("https://") {
-            path.to_string()
-        } else {
-            format!("{CDP_BASE}{path}")
-        }
-    }
-
-    fn fetch_targets() -> Option<Vec<Value>> {
-        for endpoint in ["/json/list", "/json"] {
-            if let Ok(resp) = ureq::get(&format!("{CDP_BASE}{endpoint}")).call() {
-                if let Ok(targets) = resp.into_json::<Vec<Value>>() {
-                    if !targets.is_empty() {
-                        return Some(targets);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn normalize_url(url: &str) -> String {
-        url.trim_end_matches('/').to_string()
-    }
-
-    fn urls_match(a: &str, b: &str) -> bool {
-        normalize_url(a) == normalize_url(b)
-    }
-
-    fn pick_target<'a>(targets: &'a [Value], page_url: &str) -> Option<&'a Value> {
-        let pages: Vec<&Value> = targets
-            .iter()
-            .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
-            .collect();
-
-        pages
-            .iter()
-            .copied()
-            .find(|t| {
-                t.get("url")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|u| urls_match(u, page_url))
-            })
-            .or_else(|| {
-                pages
-                    .iter()
-                    .copied()
-                    .find(|t| t.get("url").and_then(|v| v.as_str()).is_some_and(|u| !u.is_empty()))
-            })
-            .or_else(|| pages.last().copied())
     }
 }
