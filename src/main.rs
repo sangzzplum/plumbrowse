@@ -342,11 +342,14 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
     // WebView2 can pass custom-scheme URLs with empty host where the authority
     // ends up inside the path (e.g. `plum://toolbar/` -> path `/toolbar/`).
     let full = uri.to_string();
-    if host == "toolbar"
+    let is_toolbar = host == "toolbar"
         || full.starts_with("plum://toolbar")
         || path == "/toolbar"
         || path.starts_with("/toolbar/")
-    {
+        // extra safety for Windows oddities (seen as `/toolbar` with no host)
+        || (host.is_empty() && path.contains("toolbar"));
+
+    if is_toolbar {
         let html = toolbar_html();
         return Response::builder()
             .status(200)
@@ -405,6 +408,26 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
 const TOOLBAR_SCRIPT: &str = r#"
     function post(msg) {
       if (window.ipc && window.ipc.postMessage) window.ipc.postMessage(msg);
+    }
+
+    function svgFallbackDataUrl() {
+      const svg =
+        '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24">' +
+        '<circle cx="12" cy="12" r="9.4" fill="none" stroke="rgba(232,234,237,0.85)" stroke-width="1.6"/>' +
+        '<path d="M2.8 12h18.4" fill="none" stroke="rgba(154,160,166,0.85)" stroke-width="1.2"/>' +
+        '<path d="M12 2.8c2.6 2.6 4.1 6 4.1 9.2s-1.5 6.6-4.1 9.2c-2.6-2.6-4.1-6-4.1-9.2S9.4 5.4 12 2.8Z" fill="none" stroke="rgba(154,160,166,0.85)" stroke-width="1.2"/>' +
+        '</svg>';
+      return 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
+    }
+
+    function faviconUrl(pageUrl) {
+      try {
+        const u = new URL(pageUrl);
+        // simplest "real" favicon path; many sites still serve it
+        return u.origin + '/favicon.ico';
+      } catch (e) {
+        return svgFallbackDataUrl();
+      }
     }
 
     document.addEventListener('selectstart', (e) => {
@@ -520,14 +543,13 @@ const TOOLBAR_SCRIPT: &str = r#"
         t.className = 'tab' + (i === current ? ' active' : '');
         t.onclick = () => post('switch_tab:' + i);
 
-        const icon = document.createElement('div');
+        const icon = document.createElement('img');
         icon.className = 'tab-icon';
-        icon.innerHTML =
-          '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" xmlns="http://www.w3.org/2000/svg">' +
-          '<path d="M12 2.6c5.19 0 9.4 4.21 9.4 9.4 0 5.19-4.21 9.4-9.4 9.4-5.19 0-9.4-4.21-9.4-9.4 0-5.19 4.21-9.4 9.4-9.4Z" stroke="rgba(232,234,237,0.85)" stroke-width="1.6"/>' +
-          '<path d="M2.8 12h18.4" stroke="rgba(154,160,166,0.85)" stroke-width="1.2"/>' +
-          '<path d="M12 2.8c2.6 2.6 4.1 6 4.1 9.2s-1.5 6.6-4.1 9.2c-2.6-2.6-4.1-6-4.1-9.2S9.4 5.4 12 2.8Z" stroke="rgba(154,160,166,0.85)" stroke-width="1.2"/>' +
-          '</svg>';
+        icon.src = faviconUrl(tabUrls[i] || '');
+        icon.referrerPolicy = 'no-referrer';
+        icon.loading = 'lazy';
+        icon.decoding = 'async';
+        icon.onerror = () => { icon.onerror = null; icon.src = svgFallbackDataUrl(); };
 
         const tt = document.createElement('div');
         tt.className = 'tab-title';
@@ -585,7 +607,7 @@ const TAB_BAR_CSS: &str = r#"
       cursor:pointer; user-select:none; box-sizing:border-box;
     }
     .tab.active { background:var(--b2); }
-    .tab-icon { flex:0 0 auto; width:16px; height:16px; opacity:0.95; display:grid; place-items:center; }
+    .tab-icon { flex:0 0 auto; width:16px; height:16px; opacity:0.95; display:block; border-radius:4px; }
     .tab-title {
       min-width:0; overflow:hidden; white-space:nowrap;
       text-overflow:ellipsis; flex:1 1 auto;
@@ -600,7 +622,7 @@ const TAB_BAR_CSS: &str = r#"
     .tab-close:hover { background:#2a2b2f; color:var(--fg); }
     .tab-strip.scroll .tab-title { display:none; }
     .tab-strip.scroll .tab { padding:0; width:32px; border-radius:10px; display:grid; place-items:center; }
-    .tab-strip.scroll .tab-icon { width:16px; height:16px; }
+    .tab-strip.scroll .tab-close { position:static; right:auto; top:auto; }
     .tab-strip.scroll .tab:hover .tab-icon { opacity:0; }
     .tab-strip.scroll .tab:hover .tab-close { opacity:1; pointer-events:auto; }
 "#;
