@@ -1769,6 +1769,7 @@ struct WindowsRunState {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Copy, Clone)]
 struct WinAppPtr(*mut UnsafeCell<WindowsRunState>);
 
 #[cfg(target_os = "windows")]
