@@ -260,20 +260,50 @@ enum UserEvent {
     FocusTab { tab_id: u32 },
 }
 
-fn normalize_url(input: &str) -> Option<String> {
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn resolve_omnibox_input(input: &str) -> Option<String> {
     let u = input.trim();
     if u.is_empty() {
         return None;
     }
+
     if u.starts_with("http://")
         || u.starts_with("https://")
         || u.starts_with("file://")
         || u.starts_with("plum://")
     {
-        Some(u.to_string())
-    } else {
-        Some(format!("https://{u}"))
+        return Some(u.to_string());
     }
+
+    // If it contains whitespace, it's a search query.
+    if u.chars().any(char::is_whitespace) {
+        return Some(format!("https://duckduckgo.com/?q={}", percent_encode_query(u)));
+    }
+
+    // Heuristic: looks like a host if it contains a dot.
+    let looks_like_host = u.contains('.') && !u.starts_with('.') && !u.ends_with('.');
+    if looks_like_host {
+        return Some(format!("https://{u}"));
+    }
+
+    // Otherwise search.
+    Some(format!(
+        "https://duckduckgo.com/?q={}",
+        percent_encode_query(u)
+    ))
 }
 
 fn bounds_toolbar(win_w: f64) -> Rect {
@@ -583,10 +613,11 @@ const TOOLBAR_SCRIPT: &str = r#"
 const TAB_BAR_CSS: &str = r#"
     body { user-select:none; -webkit-user-select:none; }
     input { user-select:text; -webkit-user-select:text; }
-    .tabs-bar { display:flex; align-items:center; gap:8px; min-height:32px; width:100%; }
+    .tabs-bar { display:flex; align-items:center; gap:8px; height:32px; min-height:32px; width:100%; }
     .tab-strip {
       display:flex; gap:8px; align-items:center;
       flex:1 1 0%; min-width:0; width:0;
+      height:32px;
       overflow-x:auto; overflow-y:hidden;
       scrollbar-gutter: stable both-edges;
       scrollbar-width:thin; scrollbar-color:#5f6368 transparent;
@@ -976,8 +1007,7 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
     #[cfg(target_os = "windows")]
     {
         builder = builder
-            .with_url(TOOLBAR_PROTOCOL_URL)
-            .with_custom_protocol("plum".to_string(), plum_protocol)
+            .with_html(toolbar_html())
             .with_default_context_menus(false)
             .with_browser_accelerator_keys(false);
     }
@@ -1244,6 +1274,10 @@ fn main() {
             }
 
             Event::UserEvent(UserEvent::Navigated { tab_id, url }) => {
+                if url == "about:blank" {
+                    // WebView2 sometimes emits transient navigations; don't reflect them into UI.
+                    return;
+                }
                 if let Some(idx) = find_tab_idx(&tabs, tab_id) {
                     tabs[idx].url = url;
                     if idx == current {
@@ -1275,7 +1309,7 @@ fn main() {
             }
 
             Event::UserEvent(UserEvent::NewWindow { url }) => {
-                if let Some(url) = normalize_url(&url) {
+                if let Some(url) = resolve_omnibox_input(&url) {
                     open_new_tab(
                         &window,
                         &proxy,
@@ -1337,7 +1371,7 @@ fn main() {
 
                 _ if msg.starts_with("load:") => {
                     if let Some(rest) = msg.strip_prefix("load:") {
-                        if let Some(url) = normalize_url(rest) {
+                        if let Some(url) = resolve_omnibox_input(rest) {
                             tabs[current].url = url.clone();
                             tabs[current].title.clear();
                             let _ = tabs[current].webview.load_url(&url);
