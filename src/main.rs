@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use tao::{
     dpi::PhysicalSize,
-    event::{ElementState, Event, StartCause, WindowEvent},
+    event::{ElementState, Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     keyboard::{KeyCode, ModifiersState},
     window::{Icon, Window, WindowBuilder},
@@ -188,6 +188,7 @@ fn version_label() -> String {
     format!("PlumBrowser v{}", app_version())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn toolbar_navigation_allowed(url: &str) -> bool {
     // WebView2 maps custom schemes to http(s)://plum.* — must allow those through.
     if url.starts_with("http://plum.") || url.starts_with("https://plum.") {
@@ -374,7 +375,7 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
     let cur_url = tabs.get(current).map(|t| t.url.as_str()).unwrap_or("");
 
     let script = format!(
-        "window.__setState({}, {}, {}, {});",
+        "if (typeof window.__setState === 'function') {{ window.__setState({}, {}, {}, {}); }}",
         json!(titles),
         json!(urls),
         current,
@@ -516,28 +517,26 @@ const TOOLBAR_SCRIPT: &str = r#"
         }
       }
 
-      document.getElementById('back').addEventListener('click', () => post('nav_back'));
-      document.getElementById('forward').addEventListener('click', () => post('nav_forward'));
-      document.getElementById('reload').addEventListener('click', () => post('nav_reload'));
+      const back = document.getElementById('back');
+      if (back) back.addEventListener('click', () => post('nav_back'));
+      const forward = document.getElementById('forward');
+      if (forward) forward.addEventListener('click', () => post('nav_forward'));
+      const reload = document.getElementById('reload');
+      if (reload) reload.addEventListener('click', () => post('nav_reload'));
       const devtoolsBtn = document.getElementById('devtools');
       if (devtoolsBtn) devtoolsBtn.addEventListener('click', () => post('nav_devtools'));
 
       const urlInput = document.getElementById('url');
-      document.getElementById('go').addEventListener('click', () => post('load:' + urlInput.value));
-      urlInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') post('load:' + e.target.value);
-      });
-      urlInput.addEventListener('blur', () => post('focus_content'));
+      const go = document.getElementById('go');
+      if (go && urlInput) {
+        go.addEventListener('click', () => post('load:' + urlInput.value));
+        urlInput.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') post('load:' + e.target.value);
+        });
+        urlInput.addEventListener('blur', () => post('focus_content'));
+      }
 
       post('ready');
-    }
-
-    // Expose for Windows bootstrap loader.
-    window.__toolbarInit = initToolbar;
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', initToolbar);
-    } else {
-      initToolbar();
     }
 
     const TAB_MIN = 32;
@@ -553,6 +552,12 @@ const TOOLBAR_SCRIPT: &str = r#"
         if (n === 0) return;
 
         const avail = strip.clientWidth;
+        // WebView2 often reports 0 until the first real layout pass.
+        if (avail < 8) {
+          requestAnimationFrame(() => layoutTabs());
+          return;
+        }
+
         const gap = TAB_GAP;
         strip.classList.remove('scroll');
 
@@ -594,6 +599,7 @@ const TOOLBAR_SCRIPT: &str = r#"
 
     window.__setState = function(tabTitles, tabUrls, current, url) {
       const strip = document.getElementById('tab-strip');
+      if (!strip) return;
       strip.innerHTML = '';
 
       tabTitles.forEach((title, i) => {
@@ -624,7 +630,8 @@ const TOOLBAR_SCRIPT: &str = r#"
         strip.appendChild(t);
       });
 
-      document.getElementById('url').value = url || '';
+      const urlEl = document.getElementById('url');
+      if (urlEl) urlEl.value = url || '';
       layoutTabs();
     };
 
@@ -636,6 +643,12 @@ const TOOLBAR_SCRIPT: &str = r#"
       }
       layoutTabs();
     };
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initToolbar);
+    } else {
+      initToolbar();
+    }
 "#;
 
 const TAB_BAR_CSS: &str = r#"
@@ -644,7 +657,7 @@ const TAB_BAR_CSS: &str = r#"
     .tabs-bar { display:flex; align-items:center; gap:8px; height:32px; min-height:32px; width:100%; }
     .tab-strip {
       display:flex; gap:8px; align-items:center;
-      flex:1 1 0%; min-width:0; width:0;
+      flex:1 1 auto; min-width:48px;
       height:32px;
       overflow-x:auto; overflow-y:hidden;
       scrollbar-gutter: stable both-edges;
@@ -778,7 +791,8 @@ fn toolbar_html() -> String {
     .wbtn {{ width:40px; height:26px; border-radius:10px; background:var(--b); display:grid; place-items:center; cursor:pointer; }}
     .wbtn:hover {{ background:var(--b2); }}
     .wbtn.close {{ background:var(--danger); }}
-    .toolbar {{ flex:1; display:flex; flex-direction:column; gap:8px; padding:8px 12px 10px; -webkit-app-region:no-drag; }}
+    .toolbar {{ flex:1; display:flex; flex-direction:column; gap:8px; padding:8px 12px 10px; -webkit-app-region:no-drag; min-height:0; overflow:visible; }}
+    .tabs-bar {{ flex-shrink:0; }}
     {tab_bar_css}
     .addtab, .tab, .navbtn, input, .go {{ -webkit-app-region:no-drag; }}
     .row {{ display:flex; gap:8px; align-items:center; }}
@@ -1016,18 +1030,9 @@ fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
     tabs.iter().position(|t| t.id == tab_id)
 }
 
-#[cfg(target_os = "windows")]
-fn refresh_windows_toolbar(toolbar: &WebView, window: &Window, ww: f64) {
-    let html = toolbar_html();
-    let _ = toolbar.set_bounds(bounds_toolbar(ww));
-    let _ = toolbar.set_visible(true);
-    let _ = toolbar.set_theme(Theme::Dark);
-    let _ = toolbar.load_html(&html);
-    raise_toolbar(toolbar, window);
-}
-
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
     let html = toolbar_html();
+    let proxy_page = proxy.clone();
     let mut builder = WebViewBuilder::new()
         .with_bounds(bounds_toolbar(ww))
         .with_background_color(TOOLBAR_BG)
@@ -1039,13 +1044,17 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         .with_back_forward_navigation_gestures(false)
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
         .with_initialization_script(TOOLBAR_LOCK_SCRIPT)
+        .with_on_page_load_handler(move |event, _| {
+            if matches!(event, PageLoadEvent::Finished) {
+                let _ = proxy_page.send_event(UserEvent::Ipc("ready".to_string()));
+            }
+        })
         .with_ipc_handler(move |req: Request<String>| {
             let _ = proxy.send_event(UserEvent::Ipc(req.body().clone()));
         });
 
     #[cfg(target_os = "windows")]
     {
-        // Windows: inline HTML only. Custom-scheme top-level loads are unreliable as a toolbar doc.
         builder = builder
             .with_html(&html)
             .with_default_context_menus(false)
@@ -1066,7 +1075,6 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
     #[cfg(target_os = "windows")]
     {
         let _ = toolbar.set_theme(Theme::Dark);
-        let _ = toolbar.load_html(&html);
         raise_toolbar(&toolbar, window);
     }
 
@@ -1232,20 +1240,34 @@ fn main() {
     let toolbar = build_toolbar(&window, proxy.clone(), ww);
 
     raise_toolbar(&toolbar, &window);
-    sync_toolbar(&toolbar, &tabs, current);
 
     #[cfg(target_os = "windows")]
     let devtools_panel = build_devtools_panel(&window, ww, wh);
+
+    #[cfg(target_os = "windows")]
+    {
+        resize_all(
+            &window,
+            &toolbar,
+            &tabs,
+            ww,
+            wh,
+            devtools_open,
+            Some(&devtools_panel),
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        resize_all(&window, &toolbar, &tabs, ww, wh, devtools_open);
+    }
+
+    sync_toolbar(&toolbar, &tabs, current);
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
-            Event::NewEvents(StartCause::Init) => {
-                #[cfg(target_os = "windows")]
-                refresh_windows_toolbar(&toolbar, &window, ww);
-            }
-
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
 
