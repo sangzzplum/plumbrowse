@@ -6,18 +6,25 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use tao::{
     dpi::PhysicalSize,
-    event::{Event, WindowEvent},
+    event::{ElementState, Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
+    keyboard::{KeyCode, ModifiersState},
     window::{Icon, Window, WindowBuilder},
 };
 use wry::{
     dpi::{LogicalPosition, LogicalSize},
     http::{header::CONTENT_TYPE, Request, Response},
-    NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder, WebViewId,
+    NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder, WebViewId, RGBA,
 };
 
 #[cfg(target_os = "macos")]
 use tao::platform::macos::WindowBuilderExtMacOS;
+
+#[cfg(target_os = "windows")]
+use tao::platform::windows::WindowExtWindows;
+
+#[cfg(target_os = "windows")]
+use wry::WebViewBuilderExtWindows;
 
 fn logical_size(window: &Window) -> (f64, f64) {
     let size = window
@@ -118,6 +125,14 @@ fn webview_go_back(webview: &WebView) {
     }
 }
 
+fn open_docked_devtools(webview: &WebView) {
+    webview.open_devtools();
+}
+
+fn close_docked_devtools(webview: &WebView) {
+    webview.close_devtools();
+}
+
 fn webview_go_forward(webview: &WebView) {
     #[cfg(target_os = "macos")]
     {
@@ -137,6 +152,67 @@ fn webview_go_forward(webview: &WebView) {
 }
 
 const NEWTAB_URL: &str = "plum://newtab";
+const TOOLBAR_URL: &str = "plum://toolbar/";
+const DEVTOOLS_WIDTH: f64 = 420.0;
+const TOOLBAR_BG: RGBA = (32, 33, 36, 255);
+
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn version_label() -> String {
+    format!("PlumBrowser v{}", app_version())
+}
+
+fn toolbar_navigation_allowed(url: &str) -> bool {
+    url.starts_with("plum://toolbar")
+}
+
+/// Toolbar — это UI, не сайт.
+const TOOLBAR_LOCK_SCRIPT: &str = r#"
+  document.addEventListener('contextmenu', e => e.preventDefault(), true);
+  document.addEventListener('dragstart', e => e.preventDefault(), true);
+  document.addEventListener('click', e => {
+    const link = e.target.closest('a[href]');
+    if (link) { e.preventDefault(); e.stopPropagation(); }
+  }, true);
+  document.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (e.key === 'F5' || ((e.metaKey || e.ctrlKey) && k === 'r')) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, true);
+"#;
+
+const CONTENT_SHORTCUT_SCRIPT: &str = r#"
+  document.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (e.key === 'F12') {
+      e.preventDefault();
+      e.stopPropagation();
+      if (window.ipc && window.ipc.postMessage) window.ipc.postMessage('toggle_devtools');
+      return;
+    }
+    if (e.ctrlKey && e.shiftKey && k === 'i') {
+      e.preventDefault();
+      e.stopPropagation();
+      if (window.ipc && window.ipc.postMessage) window.ipc.postMessage('toggle_devtools');
+      return;
+    }
+    if (e.metaKey && e.altKey && k === 'i') {
+      e.preventDefault();
+      e.stopPropagation();
+      if (window.ipc && window.ipc.postMessage) window.ipc.postMessage('toggle_devtools');
+    }
+  }, true);
+"#;
+
+#[cfg(target_os = "windows")]
+const DEVTOOLS_PANEL_HTML: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"/><style>
+  html,body{margin:0;height:100%;background:#1e1e1e;overflow:hidden}
+</style></head><body></body></html>"#;
 
 /// Сайты показывают «браузер устарел», если UA похож на старый WebView — подставляем актуальный Chrome.
 fn content_user_agent() -> &'static str {
@@ -159,6 +235,7 @@ struct Tab {
 #[derive(Debug, Clone)]
 enum UserEvent {
     Ipc(String),
+    ToggleDevtools,
     Navigated { tab_id: u32, url: String },
     TitleChanged { tab_id: u32, title: String },
     NewWindow { url: String },
@@ -189,11 +266,26 @@ fn bounds_toolbar(win_w: f64) -> Rect {
     }
 }
 
-fn bounds_content(win_w: f64, win_h: f64) -> Rect {
+fn bounds_content(win_w: f64, win_h: f64, devtools_open: bool) -> Rect {
     let h = toolbar_height();
+    let devtools_w = if devtools_open && cfg!(target_os = "windows") {
+        DEVTOOLS_WIDTH
+    } else {
+        0.0
+    };
     Rect {
         position: LogicalPosition::new(0.0, h).into(),
-        size: LogicalSize::new(win_w, (win_h - h).max(1.0)).into(),
+        size: LogicalSize::new((win_w - devtools_w).max(1.0), (win_h - h).max(1.0)).into(),
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn bounds_devtools_panel(win_w: f64, win_h: f64) -> Rect {
+    let h = toolbar_height();
+    let content_w = (win_w - DEVTOOLS_WIDTH).max(1.0);
+    Rect {
+        position: LogicalPosition::new(content_w, h).into(),
+        size: LogicalSize::new(DEVTOOLS_WIDTH, (win_h - h).max(1.0)).into(),
     }
 }
 
@@ -225,9 +317,21 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
 }
 
 fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
-    let path = req.uri().path();
+    let uri = req.uri();
+    let host = uri.host().unwrap_or_default();
+    let path = uri.path();
+
+    if host == "toolbar" || path.starts_with("/toolbar") {
+        let html = toolbar_html();
+        return Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Cow::Owned(html.into_bytes()))
+            .unwrap();
+    }
+
     let (mime, body): (&str, Cow<'static, [u8]>) = match path {
-        "/newtab" | "/newtab/" | "/" => (
+        "/newtab" | "/newtab/" | "/" if host.is_empty() || host == "newtab" => (
             "text/html; charset=utf-8",
             Cow::Borrowed(NEWTAB_HTML.as_bytes()),
         ),
@@ -301,6 +405,8 @@ const TOOLBAR_SCRIPT: &str = r#"
       document.getElementById('back').addEventListener('click', () => post('nav_back'));
       document.getElementById('forward').addEventListener('click', () => post('nav_forward'));
       document.getElementById('reload').addEventListener('click', () => post('nav_reload'));
+      const devtoolsBtn = document.getElementById('devtools');
+      if (devtoolsBtn) devtoolsBtn.addEventListener('click', () => post('nav_devtools'));
 
       const urlInput = document.getElementById('url');
       document.getElementById('go').addEventListener('click', () => post('load:' + urlInput.value));
@@ -308,6 +414,13 @@ const TOOLBAR_SCRIPT: &str = r#"
         if (e.key === 'Enter') post('load:' + e.target.value);
       });
       urlInput.addEventListener('blur', () => post('focus_content'));
+
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'F12') {
+          e.preventDefault();
+          post('nav_devtools');
+        }
+      }, true);
 
       post('ready');
     });
@@ -383,10 +496,16 @@ const TAB_BAR_CSS: &str = r#"
       flex:1 1 auto; min-width:32px; height:32px;
       -webkit-app-region:drag;
     }
+    .version {
+      flex:0 0 auto; font-size:11px; color:var(--mut);
+      padding:0 8px; white-space:nowrap; user-select:none;
+      -webkit-app-region:drag;
+    }
 "#;
 
 fn toolbar_html() -> String {
     let toolbar_h = toolbar_height() as i32;
+    let version = version_label();
 
     if cfg!(target_os = "macos") {
         return format!(
@@ -401,7 +520,7 @@ fn toolbar_html() -> String {
       --toolbarH:{toolbar_h}px;
     }}
     * {{ box-sizing:border-box; }}
-    html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; }}
+    html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#202124; }}
     body {{ background:var(--bg); color:var(--fg); font:14px/1.2 system-ui,"Segoe UI",Arial; }}
     .chrome {{ height:var(--toolbarH); display:flex; flex-direction:column; }}
     .tabs-wrap {{ padding:28px 12px 0; }}
@@ -432,12 +551,14 @@ fn toolbar_html() -> String {
         <div class="tab-strip" id="tab-strip"></div>
         <div class="addtab" id="addtab" title="Новая вкладка">+</div>
         <div class="drag-fill"></div>
+        <div class="version">{version}</div>
       </div>
     </div>
     <div class="nav-row">
       <div class="navbtn" id="back" title="Назад">←</div>
       <div class="navbtn" id="forward" title="Вперёд">→</div>
       <div class="navbtn" id="reload" title="Обновить">↻</div>
+      <div class="navbtn" id="devtools" title="Инструменты разработчика (F12)">&#123; &#125;</div>
       <input id="url" placeholder="example.com или https://example.com" autocomplete="off" spellcheck="false" />
       <div class="go" id="go">Go</div>
     </div>
@@ -446,7 +567,8 @@ fn toolbar_html() -> String {
 </body>
 </html>"#,
             script = TOOLBAR_SCRIPT,
-            tab_bar_css = TAB_BAR_CSS
+            tab_bar_css = TAB_BAR_CSS,
+            version = version
         );
     }
 
@@ -462,7 +584,7 @@ fn toolbar_html() -> String {
       --toolbarH:{toolbar_h}px; --titlebarH:44px;
     }}
     * {{ box-sizing:border-box; }}
-    html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; }}
+    html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#202124; }}
     body {{ background:var(--bg); color:var(--fg); font:14px/1.2 system-ui,"Segoe UI",Arial; }}
     .chrome {{ height:var(--toolbarH); display:flex; flex-direction:column; }}
     .titlebar {{
@@ -496,7 +618,7 @@ fn toolbar_html() -> String {
 <body>
   <div class="chrome">
     <div class="titlebar">
-      <div class="drag" id="drag">PlumBrowser</div>
+      <div class="drag" id="drag">{version}</div>
       <div class="winbtns">
         <div class="wbtn" id="min" title="Свернуть">—</div>
         <div class="wbtn" id="max" title="Развернуть">□</div>
@@ -512,6 +634,7 @@ fn toolbar_html() -> String {
         <div class="navbtn" id="back" title="Назад">←</div>
         <div class="navbtn" id="forward" title="Вперёд">→</div>
         <div class="navbtn" id="reload" title="Обновить">↻</div>
+        <div class="navbtn" id="devtools" title="Инструменты разработчика (F12)">&#123; &#125;</div>
         <input id="url" placeholder="example.com или https://example.com" autocomplete="off" spellcheck="false" />
         <div class="go" id="go">Go</div>
       </div>
@@ -521,7 +644,8 @@ fn toolbar_html() -> String {
 </body>
 </html>"#,
         script = TOOLBAR_SCRIPT,
-        tab_bar_css = TAB_BAR_CSS
+        tab_bar_css = TAB_BAR_CSS,
+        version = version
     )
 }
 
@@ -533,17 +657,28 @@ fn build_content_webview(
     ww: f64,
     wh: f64,
     visible: bool,
+    devtools_open: bool,
 ) -> WebView {
-    WebViewBuilder::new()
+    let builder = WebViewBuilder::new()
         .with_url(url)
         .with_user_agent(content_user_agent())
-        .with_bounds(bounds_content(ww, wh))
+        .with_bounds(bounds_content(ww, wh, devtools_open))
         .with_visible(visible)
         .with_focused(visible)
         .with_clipboard(true)
         .with_back_forward_navigation_gestures(true)
-        .with_devtools(cfg!(debug_assertions))
+        .with_devtools(true)
+        .with_hotkeys_zoom(true)
+        .with_initialization_script(CONTENT_SHORTCUT_SCRIPT)
         .with_custom_protocol("plum".to_string(), plum_protocol)
+        .with_ipc_handler({
+            let proxy = proxy.clone();
+            move |req: Request<String>| {
+                if req.body() == "toggle_devtools" {
+                    let _ = proxy.send_event(UserEvent::ToggleDevtools);
+                }
+            }
+        })
         .with_on_page_load_handler({
             let proxy = proxy.clone();
             move |event, _| {
@@ -574,26 +709,138 @@ fn build_content_webview(
                 let _ = proxy.send_event(UserEvent::NewWindow { url: nav_url });
                 NewWindowResponse::Deny
             }
-        })
+        });
+
+    #[cfg(target_os = "windows")]
+    let builder = builder.with_browser_accelerator_keys(false);
+
+    builder
         .build_as_child(window)
         .expect("failed to build content webview")
 }
 
-fn show_tab(tabs: &[Tab], current: usize, toolbar: &WebView) {
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+fn show_tab(
+    window: &Window,
+    tabs: &[Tab],
+    current: usize,
+    toolbar: &WebView,
+    devtools_open: bool,
+    ww: f64,
+    wh: f64,
+    #[cfg(target_os = "windows")] devtools_panel: Option<&WebView>,
+) {
     for (i, tab) in tabs.iter().enumerate() {
         let visible = i == current;
         let _ = tab.webview.set_visible(visible);
+        if !visible {
+            close_docked_devtools(&tab.webview);
+        }
+    }
+    if devtools_open {
+        if let Some(tab) = tabs.get(current) {
+            open_docked_devtools(&tab.webview);
+            #[cfg(target_os = "windows")]
+            {
+                win_devtools::close_floating_window();
+                win_devtools::embed_after_open(bounds_devtools_panel(ww, wh), window.scale_factor());
+                if let Some(panel) = devtools_panel {
+                    let _ = panel.set_visible(true);
+                }
+            }
+        }
     }
     focus_active_tab(tabs, current);
     raise_toolbar(toolbar);
 }
 
-fn resize_all(toolbar: &WebView, tabs: &[Tab], ww: f64, wh: f64) {
+#[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+fn resize_all(
+    window: &Window,
+    toolbar: &WebView,
+    tabs: &[Tab],
+    ww: f64,
+    wh: f64,
+    devtools_open: bool,
+    #[cfg(target_os = "windows")] devtools_panel: Option<&WebView>,
+) {
     let _ = toolbar.set_bounds(bounds_toolbar(ww));
-    let bounds = bounds_content(ww, wh);
+    let bounds = bounds_content(ww, wh, devtools_open);
     for tab in tabs {
         let _ = tab.webview.set_bounds(bounds);
     }
+    #[cfg(target_os = "windows")]
+    if let Some(panel) = devtools_panel {
+        let _ = panel.set_bounds(bounds_devtools_panel(ww, wh));
+        let _ = panel.set_visible(devtools_open);
+        win_devtools::register_panel_host(
+            window.hwnd(),
+            bounds_devtools_panel(ww, wh),
+            window.scale_factor(),
+        );
+        if devtools_open {
+            win_devtools::reposition_embedded(bounds_devtools_panel(ww, wh), window.scale_factor());
+        }
+    }
+}
+
+fn devtools_shortcut(physical_key: KeyCode, modifiers: ModifiersState) -> bool {
+    if physical_key == KeyCode::F12 {
+        return true;
+    }
+    let inspect_combo = modifiers.control_key()
+        && modifiers.shift_key()
+        && matches!(physical_key, KeyCode::KeyI);
+    #[cfg(target_os = "macos")]
+    let inspect_combo = inspect_combo
+        || (modifiers.super_key() && modifiers.alt_key() && matches!(physical_key, KeyCode::KeyI));
+    inspect_combo
+}
+
+fn toggle_devtools(
+    window: &Window,
+    toolbar: &WebView,
+    tabs: &[Tab],
+    current: usize,
+    devtools_open: &mut bool,
+    ww: f64,
+    wh: f64,
+    #[cfg(target_os = "windows")] devtools_panel: Option<&WebView>,
+) {
+    let Some(tab) = tabs.get(current) else {
+        return;
+    };
+
+    if *devtools_open {
+        close_docked_devtools(&tab.webview);
+        #[cfg(target_os = "windows")]
+        win_devtools::close_floating_window();
+        *devtools_open = false;
+    } else {
+        *devtools_open = true;
+        open_docked_devtools(&tab.webview);
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(panel) = devtools_panel {
+                let _ = panel.set_visible(true);
+                let _ = panel.set_bounds(bounds_devtools_panel(ww, wh));
+            }
+            win_devtools::embed_after_open(bounds_devtools_panel(ww, wh), window.scale_factor());
+        }
+    }
+
+    resize_all(
+        window,
+        toolbar,
+        tabs,
+        ww,
+        wh,
+        *devtools_open,
+        #[cfg(target_os = "windows")]
+        devtools_panel,
+    );
+    raise_toolbar(toolbar);
+    focus_active_tab(tabs, current);
 }
 
 fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
@@ -601,16 +848,48 @@ fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
 }
 
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
-    WebViewBuilder::new()
-        .with_html(toolbar_html())
+    let builder = WebViewBuilder::new()
+        .with_url(TOOLBAR_URL)
         .with_bounds(bounds_toolbar(ww))
+        .with_background_color(TOOLBAR_BG)
         .with_focused(false)
         .with_accept_first_mouse(true)
+        .with_devtools(false)
+        .with_hotkeys_zoom(false)
+        .with_back_forward_navigation_gestures(false)
+        .with_custom_protocol("plum".to_string(), plum_protocol)
+        .with_navigation_handler(|url| toolbar_navigation_allowed(&url))
+        .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+        .with_initialization_script(TOOLBAR_LOCK_SCRIPT)
         .with_ipc_handler(move |req: Request<String>| {
             let _ = proxy.send_event(UserEvent::Ipc(req.body().clone()));
-        })
+        });
+
+    #[cfg(target_os = "windows")]
+    let builder = builder
+        .with_default_context_menus(false)
+        .with_browser_accelerator_keys(false);
+
+    builder
         .build_as_child(window)
         .expect("failed to build toolbar webview")
+}
+
+#[cfg(target_os = "windows")]
+fn build_devtools_panel(window: &Window, ww: f64, wh: f64) -> WebView {
+    WebViewBuilder::new()
+        .with_html(DEVTOOLS_PANEL_HTML)
+        .with_bounds(bounds_devtools_panel(ww, wh))
+        .with_background_color((30, 30, 30, 255))
+        .with_visible(false)
+        .with_devtools(false)
+        .with_hotkeys_zoom(false)
+        .with_navigation_handler(|_| false)
+        .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+        .with_default_context_menus(false)
+        .with_browser_accelerator_keys(false)
+        .build_as_child(window)
+        .expect("failed to build devtools panel")
 }
 
 fn open_new_tab(
@@ -623,6 +902,8 @@ fn open_new_tab(
     url: &str,
     ww: f64,
     wh: f64,
+    devtools_open: bool,
+    #[cfg(target_os = "windows")] devtools_panel: Option<&WebView>,
 ) {
     for tab in tabs.iter() {
         let _ = tab.webview.set_visible(false);
@@ -637,7 +918,16 @@ fn open_new_tab(
         String::new()
     };
 
-    let webview = build_content_webview(window, proxy.clone(), tab_id, url, ww, wh, true);
+    let webview = build_content_webview(
+        window,
+        proxy.clone(),
+        tab_id,
+        url,
+        ww,
+        wh,
+        true,
+        devtools_open,
+    );
     tabs.push(Tab {
         id: tab_id,
         url: url.to_string(),
@@ -645,14 +935,29 @@ fn open_new_tab(
         webview,
     });
     *current = tabs.len() - 1;
+    if devtools_open {
+        open_docked_devtools(&tabs[*current].webview);
+        #[cfg(target_os = "windows")]
+        win_devtools::embed_after_open(bounds_devtools_panel(ww, wh), window.scale_factor());
+    }
     sync_toolbar(toolbar, tabs, *current);
+    resize_all(
+        window,
+        toolbar,
+        tabs,
+        ww,
+        wh,
+        devtools_open,
+        #[cfg(target_os = "windows")]
+        devtools_panel,
+    );
     focus_active_tab(tabs, *current);
     raise_toolbar(toolbar);
 }
 
 fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
     let mut builder = WindowBuilder::new()
-        .with_title("PlumBrowser")
+        .with_title(version_label())
         .with_inner_size(LogicalSize::new(1200.0, 800.0));
 
     if let Some(icon) = load_window_icon() {
@@ -688,6 +993,9 @@ fn main() {
     let (mut ww, mut wh) = logical_size(&window);
 
     let mut next_id: u32 = 1;
+    let mut devtools_open = false;
+    let mut modifiers = ModifiersState::empty();
+
     let first_webview = build_content_webview(
         &window,
         proxy.clone(),
@@ -696,6 +1004,7 @@ fn main() {
         ww,
         wh,
         true,
+        devtools_open,
     );
     next_id += 1;
 
@@ -711,6 +1020,15 @@ fn main() {
     raise_toolbar(&toolbar);
     sync_toolbar(&toolbar, &tabs, current);
 
+    #[cfg(target_os = "windows")]
+    let devtools_panel = build_devtools_panel(&window, ww, wh);
+    #[cfg(target_os = "windows")]
+    win_devtools::register_panel_host(
+        window.hwnd(),
+        bounds_devtools_panel(ww, wh),
+        window.scale_factor(),
+    );
+
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
 
@@ -721,7 +1039,16 @@ fn main() {
                 WindowEvent::Resized(sz) => {
                     let scale = window.scale_factor();
                     (ww, wh) = logical_size_from_physical(sz, scale);
-                    resize_all(&toolbar, &tabs, ww, wh);
+                    resize_all(
+                        &window,
+                        &toolbar,
+                        &tabs,
+                        ww,
+                        wh,
+                        devtools_open,
+                        #[cfg(target_os = "windows")]
+                        Some(&devtools_panel),
+                    );
                     raise_toolbar(&toolbar);
                 }
 
@@ -730,14 +1057,62 @@ fn main() {
                     new_inner_size,
                 } => {
                     (ww, wh) = logical_size_from_physical(*new_inner_size, scale_factor);
-                    resize_all(&toolbar, &tabs, ww, wh);
+                    resize_all(
+                        &window,
+                        &toolbar,
+                        &tabs,
+                        ww,
+                        wh,
+                        devtools_open,
+                        #[cfg(target_os = "windows")]
+                        Some(&devtools_panel),
+                    );
                     raise_toolbar(&toolbar);
+                }
+
+                WindowEvent::ModifiersChanged(m) => modifiers = m,
+
+                WindowEvent::KeyboardInput {
+                    event:
+                        tao::event::KeyEvent {
+                            physical_key,
+                            state: ElementState::Pressed,
+                            repeat: false,
+                            ..
+                        },
+                    ..
+                } if devtools_shortcut(physical_key, modifiers) => {
+                    toggle_devtools(
+                        &window,
+                        &toolbar,
+                        &tabs,
+                        current,
+                        &mut devtools_open,
+                        ww,
+                        wh,
+                        #[cfg(target_os = "windows")]
+                        Some(&devtools_panel),
+                    );
                 }
 
                 WindowEvent::Focused(true) => focus_active_tab(&tabs, current),
 
                 _ => {}
             },
+
+            Event::UserEvent(UserEvent::ToggleDevtools) => {
+                toggle_devtools(
+                    &window,
+                    &toolbar,
+                    &tabs,
+                    current,
+                    &mut devtools_open,
+                    ww,
+                    wh,
+                    #[cfg(target_os = "windows")]
+                    Some(&devtools_panel),
+                );
+            }
 
             Event::UserEvent(UserEvent::FocusTab { tab_id }) => {
                 if let Some(idx) = find_tab_idx(&tabs, tab_id) {
@@ -790,6 +1165,9 @@ fn main() {
                         &url,
                         ww,
                         wh,
+                        devtools_open,
+                        #[cfg(target_os = "windows")]
+                        Some(&devtools_panel),
                     );
                 }
             }
@@ -822,6 +1200,20 @@ fn main() {
                     focus_active_tab(&tabs, current);
                 }
 
+                "nav_devtools" => {
+                    toggle_devtools(
+                        &window,
+                        &toolbar,
+                        &tabs,
+                        current,
+                        &mut devtools_open,
+                        ww,
+                        wh,
+                        #[cfg(target_os = "windows")]
+                        Some(&devtools_panel),
+                    );
+                }
+
                 _ if msg.starts_with("load:") => {
                     if let Some(rest) = msg.strip_prefix("load:") {
                         if let Some(url) = normalize_url(rest) {
@@ -846,6 +1238,9 @@ fn main() {
                         NEWTAB_URL,
                         ww,
                         wh,
+                        devtools_open,
+                        #[cfg(target_os = "windows")]
+                        Some(&devtools_panel),
                     );
                 }
 
@@ -854,7 +1249,17 @@ fn main() {
                         if let Ok(idx) = rest.trim().parse::<usize>() {
                             if idx < tabs.len() {
                                 current = idx;
-                                show_tab(&tabs, current, &toolbar);
+                                show_tab(
+                                    &window,
+                                    &tabs,
+                                    current,
+                                    &toolbar,
+                                    devtools_open,
+                                    ww,
+                                    wh,
+                                    #[cfg(target_os = "windows")]
+                                    Some(&devtools_panel),
+                                );
                                 sync_toolbar(&toolbar, &tabs, current);
                             }
                         }
@@ -877,6 +1282,9 @@ fn main() {
                                         NEWTAB_URL,
                                         ww,
                                         wh,
+                                        devtools_open,
+                                        #[cfg(target_os = "windows")]
+                                        Some(&devtools_panel),
                                     );
                                 } else {
                                     if idx < current {
@@ -884,7 +1292,17 @@ fn main() {
                                     } else {
                                         current = current.min(tabs.len() - 1);
                                     }
-                                    show_tab(&tabs, current, &toolbar);
+                                    show_tab(
+                                        &window,
+                                        &tabs,
+                                        current,
+                                        &toolbar,
+                                        devtools_open,
+                                        ww,
+                                        wh,
+                                        #[cfg(target_os = "windows")]
+                                        Some(&devtools_panel),
+                                    );
                                     sync_toolbar(&toolbar, &tabs, current);
                                 }
                             }
@@ -898,4 +1316,228 @@ fn main() {
             _ => {}
         }
     });
+}
+
+#[cfg(target_os = "windows")]
+mod win_devtools {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumChildWindows, EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW,
+        GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, MoveWindow, PostMessageW,
+        SetParent, ShowWindow, GWL_STYLE, SW_SHOW, WM_CLOSE, WS_CHILD, WS_POPUP,
+    };
+    use wry::{dpi::Position, Rect};
+
+    static EMBEDDED_HWND: AtomicIsize = AtomicIsize::new(0);
+    static PANEL_HOST_HWND: AtomicIsize = AtomicIsize::new(0);
+
+    pub fn register_panel_host(main_hwnd: isize, panel: Rect, scale: f64) {
+        let target = rect_to_physical(panel, scale);
+        if let Some(hwnd) = find_child_near(main_hwnd, &target) {
+            PANEL_HOST_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+        }
+    }
+
+    pub fn embed_after_open(panel: Rect, scale: f64) {
+        let parent = panel_host();
+        let local = local_panel_rect(panel, scale);
+        thread::spawn(move || {
+            for _ in 0..80 {
+                thread::sleep(Duration::from_millis(50));
+                if let Some(devtools) = find_devtools_window() {
+                    embed_window(devtools, parent, &local);
+                    EMBEDDED_HWND.store(devtools.0 as isize, Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+    }
+
+    pub fn reposition_embedded(panel: Rect, scale: f64) {
+        let hwnd = EMBEDDED_HWND.load(Ordering::SeqCst);
+        if hwnd == 0 {
+            return;
+        }
+        let devtools = HWND(hwnd as _);
+        if !unsafe { IsWindowVisible(devtools).as_bool() } {
+            return;
+        }
+        embed_window(devtools, panel_host(), &local_panel_rect(panel, scale));
+    }
+
+    pub fn close_floating_window() {
+        let hwnd = EMBEDDED_HWND.load(Ordering::SeqCst);
+        if hwnd != 0 {
+            unsafe {
+                let _ = PostMessageW(Some(HWND(hwnd as _)), WM_CLOSE, None, None);
+            }
+            EMBEDDED_HWND.store(0, Ordering::SeqCst);
+            return;
+        }
+        if let Some(devtools) = find_devtools_window() {
+            unsafe {
+                let _ = PostMessageW(Some(devtools), WM_CLOSE, None, None);
+            }
+        }
+    }
+
+    fn panel_host() -> HWND {
+        let hwnd = PANEL_HOST_HWND.load(Ordering::SeqCst);
+        if hwnd != 0 {
+            HWND(hwnd as _)
+        } else {
+            HWND::default()
+        }
+    }
+
+    fn local_panel_rect(panel: Rect, scale: f64) -> RECT {
+        let size = panel.size.to_physical(scale);
+        RECT {
+            left: 0,
+            top: 0,
+            right: size.width.round() as i32,
+            bottom: size.height.round() as i32,
+        }
+    }
+
+    fn rect_to_physical(panel: Rect, scale: f64) -> RECT {
+        let Position { x, y } = panel.position.to_physical(scale);
+        let size = panel.size.to_physical(scale);
+        RECT {
+            left: x.round() as i32,
+            top: y.round() as i32,
+            right: (x + size.width).round() as i32,
+            bottom: (y + size.height).round() as i32,
+        }
+    }
+
+    fn find_child_near(main_hwnd: isize, target: &RECT) -> Option<HWND> {
+        let mut ctx = FindChildCtx {
+            target: *target,
+            best: HWND::default(),
+            best_dist: i64::MAX,
+        };
+        unsafe {
+            let _ = EnumChildWindows(
+                Some(HWND(main_hwnd as _)),
+                Some(enum_child),
+                LPARAM(&mut ctx as *mut _ as isize),
+            );
+        }
+        if ctx.best.0.is_null() {
+            None
+        } else {
+            Some(ctx.best)
+        }
+    }
+
+    struct FindChildCtx {
+        target: RECT,
+        best: HWND,
+        best_dist: i64,
+    }
+
+    unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut FindChildCtx);
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return true.into();
+        }
+        let dist = (rect.left - ctx.target.left).abs() as i64
+            + (rect.top - ctx.target.top).abs() as i64
+            + (rect.right - ctx.target.right).abs() as i64
+            + (rect.bottom - ctx.target.bottom).abs() as i64;
+        if dist < ctx.best_dist {
+            ctx.best = hwnd;
+            ctx.best_dist = dist;
+        }
+        true.into()
+    }
+
+    fn embed_window(devtools: HWND, parent: HWND, local: &RECT) {
+        if parent.0.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = SetParent(devtools, Some(parent));
+            let style =
+                windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(devtools, GWL_STYLE)
+                    as u32;
+            let child_style = (style & !WS_POPUP.0) | WS_CHILD.0;
+            windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+                devtools,
+                GWL_STYLE,
+                child_style as isize,
+            );
+            let w = local.right - local.left;
+            let h = local.bottom - local.top;
+            let _ = MoveWindow(devtools, local.left, local.top, w, h, true);
+            let _ = ShowWindow(devtools, SW_SHOW);
+        }
+    }
+
+    fn find_devtools_window() -> Option<HWND> {
+        let pid = unsafe { GetCurrentProcessId() };
+        unsafe {
+            let mut found = HWND::default();
+            let mut ctx = FindDevtoolsCtx {
+                pid,
+                found: &mut found,
+            };
+            let _ = EnumWindows(Some(enum_devtools), LPARAM(&mut ctx as *mut _ as isize));
+            if found.0.is_null() {
+                None
+            } else {
+                Some(found)
+            }
+        }
+    }
+
+    struct FindDevtoolsCtx<'a> {
+        pid: u32,
+        found: &'a mut HWND,
+    }
+
+    unsafe extern "system" fn enum_devtools(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut FindDevtoolsCtx<'_>);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return true.into();
+        }
+
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != ctx.pid {
+            return true.into();
+        }
+
+        let mut class_buf = [0u16; 256];
+        let class_len = GetClassNameW(hwnd, &mut class_buf);
+        if class_len > 0 {
+            let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
+            if class_name.contains("Chrome_WidgetWin") {
+                *ctx.found = hwnd;
+                return false.into();
+            }
+        }
+
+        let len = GetWindowTextLengthW(hwnd);
+        if len > 0 {
+            let mut buf = vec![0u16; (len + 1) as usize];
+            let read = GetWindowTextW(hwnd, &mut buf);
+            if read > 0 {
+                let title = String::from_utf16_lossy(&buf[..read as usize]);
+                if title.contains("DevTools") {
+                    *ctx.found = hwnd;
+                    return false.into();
+                }
+            }
+        }
+
+        true.into()
+    }
 }
