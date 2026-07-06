@@ -224,7 +224,7 @@ fn enforce_content_clipping(webview: &WebView, window: &Window) {
     unsafe {
         let rgn = CreateRectRgn(0, clip_top, client_w, client_h);
         if !rgn.is_invalid() {
-            let _ = SetWindowRgn(host, rgn, true);
+            let _ = SetWindowRgn(host, Some(rgn), true);
         }
     }
 }
