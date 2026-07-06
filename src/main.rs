@@ -4,6 +4,8 @@
 use serde_json::json;
 use std::borrow::Cow;
 use std::path::PathBuf;
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use tao::{
     dpi::PhysicalSize,
     event::{ElementState, Event, WindowEvent},
@@ -21,7 +23,13 @@ use wry::{
 use tao::platform::macos::WindowBuilderExtMacOS;
 
 #[cfg(target_os = "windows")]
+use tao::platform::windows::WindowExtWindows;
+
+#[cfg(target_os = "windows")]
 use wry::{Theme, WebViewBuilderExtWindows, WebViewExtWindows};
+
+#[cfg(target_os = "windows")]
+static TOOLBAR_IPC: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
 
 fn logical_size(window: &Window) -> (f64, f64) {
     let size = window
@@ -144,6 +152,7 @@ fn raise_toolbar(
         if let Some(tabs) = tabs {
             sync_windows_z_order(toolbar, tabs, devtools_panel);
         }
+        let _ = toolbar.focus();
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -363,6 +372,8 @@ enum UserEvent {
     TitleChanged { tab_id: u32, title: String },
     NewWindow { url: String },
     FocusTab { tab_id: u32 },
+    #[cfg(target_os = "windows")]
+    DeferredLayout,
 }
 
 fn percent_encode_query(s: &str) -> String {
@@ -424,6 +435,59 @@ fn toolbar_ipc_from_navigation(url: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_toolbar_file_url(html: &str) -> String {
+    let path = std::env::temp_dir().join("plumbrowser_toolbar.html");
+    let _ = std::fs::write(&path, html);
+    let abs = std::fs::canonicalize(&path).unwrap_or(path);
+    let mut s = abs.to_string_lossy().to_string();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        s = stripped.to_string();
+    }
+    format!("file:///{}", s.replace('\\', "/"))
+}
+
+#[cfg(target_os = "windows")]
+fn send_toolbar_ipc(msg: impl Into<String>) {
+    if let Some(proxy) = TOOLBAR_IPC.get() {
+        let _ = proxy.send_event(UserEvent::Ipc(msg.into()));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn enforce_content_below_toolbar(
+    window: &Window,
+    toolbar: &WebView,
+    tabs: &[Tab],
+    devtools_open: bool,
+) {
+    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::UI::WindowsAndMessaging::MapWindowPoints;
+
+    let parent = HWND(window.hwnd() as _);
+    let scale = window.scale_factor();
+    let min_y = (toolbar_height() * scale - 4.0).max(0.0) as i32;
+    let (ww, wh) = logical_size(window);
+    let mut fixed = false;
+
+    for tab in tabs {
+        let Some(host) = webview_host_hwnd(&tab.webview) else {
+            continue;
+        };
+        let mut pt = POINT { x: 0, y: 0 };
+        unsafe {
+            let _ = MapWindowPoints(Some(host), Some(parent), std::slice::from_mut(&mut pt), 1);
+        }
+        if pt.y < min_y {
+            let _ = tab.webview.set_bounds(bounds_content(ww, wh, devtools_open));
+            fixed = true;
+        }
+    }
+    if fixed {
+        let _ = toolbar.set_bounds(bounds_toolbar(ww));
+    }
 }
 
 fn resolve_omnibox_input(input: &str) -> Option<String> {
@@ -555,10 +619,23 @@ fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static,
     let uri = req.uri();
     let host = uri.host().unwrap_or_default();
     let path = uri.path();
+    let full = uri.to_string();
+
+    // IPC-команды тулбара (plum://ipc/*) — запасной путь, если NavigationStarting не сработал.
+    #[cfg(target_os = "windows")]
+    if let Some(msg) = toolbar_ipc_from_navigation(&full) {
+        send_toolbar_ipc(msg);
+        return Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Cow::Borrowed(
+                br#"<html><head><script>try{history.length>1&&history.back();}catch(e){}</script></head><body></body></html>"#,
+            ))
+            .unwrap();
+    }
 
     // WebView2 can pass custom-scheme URLs with empty host where the authority
     // ends up inside the path (e.g. `plum://toolbar/` -> path `/toolbar/`).
-    let full = uri.to_string();
     let is_toolbar = host == "toolbar"
         || full.starts_with("plum://toolbar")
         || full.starts_with("http://plum.toolbar")
@@ -625,12 +702,6 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
 
 const TOOLBAR_SCRIPT: &str = r#"
     function post(msg) {
-      if (window.__PLUM_IPC_NAV) {
-        try {
-          window.location.href = 'plum://ipc/' + encodeURIComponent(msg);
-          return;
-        } catch (e) {}
-      }
       try {
         if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
           window.chrome.webview.postMessage(msg);
@@ -641,6 +712,11 @@ const TOOLBAR_SCRIPT: &str = r#"
           return;
         }
       } catch (e) {}
+      if (window.__PLUM_IPC_NAV) {
+        try {
+          window.location.href = 'plum://ipc/' + encodeURIComponent(msg);
+        } catch (e2) {}
+      }
     }
 
     function svgFallbackDataUrl() {
@@ -1286,10 +1362,11 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
 
     #[cfg(target_os = "windows")]
     {
-        // NavigateToString (with_html) → about:blank: postMessage и plum://ipc не работают.
-        // Грузим через plum://toolbar/ — нормальная навигация + custom protocol.
+        let html = toolbar_html();
+        let file_url = windows_toolbar_file_url(&html);
+        // file:// — нормальный origin (не about:blank): postMessage и NavigationStarting работают.
         builder = builder
-            .with_url("plum://toolbar/")
+            .with_url(&file_url)
             .with_custom_protocol("plum".to_string(), plum_protocol)
             .with_default_context_menus(false)
             .with_browser_accelerator_keys(false)
@@ -1298,7 +1375,7 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
                     let _ = proxy_nav.send_event(UserEvent::Ipc(msg));
                     return false;
                 }
-                toolbar_navigation_allowed(&url)
+                url.starts_with("file://") || toolbar_navigation_allowed(&url)
             });
     }
 
@@ -1450,6 +1527,9 @@ fn main() {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
+    #[cfg(target_os = "windows")]
+    let _ = TOOLBAR_IPC.set(proxy.clone());
+
     let window = build_window(&event_loop);
     set_dock_icon();
 
@@ -1516,6 +1596,19 @@ fn main() {
     }
 
     sync_toolbar(&toolbar, &tabs, current);
+
+    #[cfg(target_os = "windows")]
+    {
+        enforce_content_below_toolbar(&window, &toolbar, &tabs, devtools_open);
+        let layout_proxy = proxy.clone();
+        std::thread::spawn(move || {
+            for ms in [150u64, 400, 800] {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                let _ = layout_proxy.send_event(UserEvent::DeferredLayout);
+                let _ = layout_proxy.send_event(UserEvent::Ipc("ready".to_string()));
+            }
+        });
+    }
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -1603,6 +1696,28 @@ fn main() {
 
                 _ => {}
             },
+
+            #[cfg(target_os = "windows")]
+            Event::UserEvent(UserEvent::DeferredLayout) => {
+                enforce_content_below_toolbar(&window, &toolbar, &tabs, devtools_open);
+                resize_all(
+                    &window,
+                    &toolbar,
+                    &tabs,
+                    ww,
+                    wh,
+                    devtools_open,
+                    Some(&devtools_panel),
+                );
+                raise_toolbar(
+                    &toolbar,
+                    &window,
+                    Some(&tabs),
+                    Some(&devtools_panel),
+                );
+                nudge_toolbar_layout(&toolbar, ww);
+                sync_toolbar(&toolbar, &tabs, current);
+            }
 
             Event::UserEvent(UserEvent::ToggleDevtools) => {
                 toggle_devtools(
