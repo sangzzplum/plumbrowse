@@ -949,7 +949,10 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
         return;
     }
 
-    let _ = toolbar_apply_state(toolbar, tabs, current);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = toolbar_apply_state(toolbar, tabs, current);
+    }
 }
 
 fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
@@ -2064,32 +2067,31 @@ fn toggle_devtools(
         return;
     }
 
-    if *devtools_open {
-        close_docked_devtools(&tab.webview);
-        *devtools_open = false;
-    } else {
-        *devtools_open = true;
-        open_docked_devtools(&tab.webview);
-    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if *devtools_open {
+            close_docked_devtools(&tab.webview);
+            *devtools_open = false;
+        } else {
+            *devtools_open = true;
+            open_docked_devtools(&tab.webview);
+        }
 
-    resize_all(
-        window,
-        toolbar,
-        tabs,
-        ww,
-        wh,
-        *devtools_open,
-        #[cfg(target_os = "windows")]
-        devtools_panel,
-    );
-    raise_toolbar(
-        toolbar,
-        window,
-        Some(tabs),
-        #[cfg(target_os = "windows")]
-        devtools_panel,
-    );
-    focus_active_tab(tabs, current);
+        resize_all(
+            window,
+            toolbar,
+            tabs,
+            ww,
+            wh,
+            *devtools_open,
+        );
+        raise_toolbar(
+            toolbar,
+            window,
+            Some(tabs),
+        );
+        focus_active_tab(tabs, current);
+    }
 }
 
 fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
@@ -3565,6 +3567,7 @@ fn main() {
     #[cfg_attr(target_os = "windows", allow(unused_mut))]
     let (mut ww, mut wh) = logical_size(&window);
 
+    #[cfg(not(target_os = "windows"))]
     let mut next_id: u32 = 1;
     #[cfg_attr(target_os = "windows", allow(unused_mut))]
     let mut devtools_open = false;
@@ -3601,31 +3604,29 @@ fn main() {
         return;
     }
 
-    let first_webview = build_content_webview(
-        &window,
-        proxy.clone(),
-        next_id,
-        NEWTAB_URL,
-        ww,
-        wh,
-        true,
-        devtools_open,
-    );
-    next_id += 1;
-
-    #[cfg_attr(target_os = "windows", allow(unused_mut))]
-    let mut tabs = vec![Tab {
-        id: 1,
-        url: NEWTAB_URL.to_string(),
-        title: "Новая вкладка".to_string(),
-        loading: false,
-        webview: first_webview,
-    }];
-    #[cfg_attr(target_os = "windows", allow(unused_mut))]
-    let mut current: usize = 0;
-
     #[cfg(not(target_os = "windows"))]
     {
+        let first_webview = build_content_webview(
+            &window,
+            proxy.clone(),
+            next_id,
+            NEWTAB_URL,
+            ww,
+            wh,
+            true,
+            devtools_open,
+        );
+        next_id += 1;
+
+        let mut tabs = vec![Tab {
+            id: 1,
+            url: NEWTAB_URL.to_string(),
+            title: "Новая вкладка".to_string(),
+            loading: false,
+            webview: first_webview,
+        }];
+        let mut current: usize = 0;
+
         raise_toolbar(
             &toolbar,
             &window,
@@ -3720,7 +3721,22 @@ mod win_devtools {
             return Some(hit);
         }
 
-        pick_target(&pages, page_url)
+        pages
+            .iter()
+            .copied()
+            .find(|t| {
+                t.get("url")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|u| target_matches_page(u, page_url))
+            })
+            .or_else(|| {
+                pages.iter().copied().find(|t| {
+                    t.get("url").and_then(|v| v.as_str()).is_some_and(|u| {
+                        !u.is_empty() && u != "about:blank"
+                    })
+                })
+            })
+            .or_else(|| pages.last().copied())
     }
 
     fn frontend_url(path: &str) -> String {
@@ -3768,27 +3784,5 @@ mod win_devtools {
                 || target.contains("plum.newtab");
         }
         false
-    }
-
-    fn pick_target<'a>(targets: &'a [&Value], page_url: &str) -> Option<&'a Value> {
-        targets
-            .iter()
-            .copied()
-            .find(|t| {
-                t.get("url")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|u| target_matches_page(u, page_url))
-            })
-            .or_else(|| {
-                targets
-                    .iter()
-                    .copied()
-                    .find(|t| {
-                        t.get("url").and_then(|v| v.as_str()).is_some_and(|u| {
-                            !u.is_empty() && u != "about:blank"
-                        })
-                    })
-            })
-            .or_else(|| targets.last().copied())
     }
 }
