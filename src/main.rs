@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use std::cell::UnsafeCell;
 use tao::{
     dpi::PhysicalSize,
-    event::{ElementState, Event, WindowEvent},
+    event::{ElementState, Event, MouseButton, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
     keyboard::{KeyCode, ModifiersState},
     window::{Icon, Window, WindowBuilder},
@@ -384,7 +384,9 @@ fn webview_go_forward(webview: &WebView) {
 
 const NEWTAB_URL: &str = "plum://newtab";
 const OMNIBOX_PLACEHOLDER: &str = "Введите адрес или выполните поиск";
-const DEVTOOLS_WIDTH: f64 = 420.0;
+const DEVTOOLS_WIDTH_DEFAULT: f64 = 520.0;
+const DEVTOOLS_WIDTH_MIN: f64 = 280.0;
+const DEVTOOLS_SPLITTER_HIT: f64 = 6.0;
 const TOOLBAR_BG: RGBA = (32, 33, 36, 255);
 
 fn app_version() -> &'static str {
@@ -830,27 +832,37 @@ fn bounds_toolbar(win_w: f64) -> Rect {
     }
 }
 
-fn bounds_content(win_w: f64, win_h: f64, devtools_open: bool) -> Rect {
+fn bounds_content(win_w: f64, win_h: f64, devtools_open: bool, devtools_w: f64) -> Rect {
     let h = toolbar_height();
-    let devtools_w = if devtools_open && cfg!(target_os = "windows") {
-        DEVTOOLS_WIDTH
+    let panel_w = if devtools_open && cfg!(target_os = "windows") {
+        devtools_w
     } else {
         0.0
     };
     Rect {
         position: LogicalPosition::new(0.0, h).into(),
-        size: LogicalSize::new((win_w - devtools_w).max(1.0), (win_h - h).max(1.0)).into(),
+        size: LogicalSize::new((win_w - panel_w).max(1.0), (win_h - h).max(1.0)).into(),
     }
 }
 
 #[cfg(target_os = "windows")]
-fn bounds_devtools_panel(win_w: f64, win_h: f64) -> Rect {
+fn bounds_devtools_panel(win_w: f64, win_h: f64, devtools_w: f64) -> Rect {
     let h = toolbar_height();
-    let content_w = (win_w - DEVTOOLS_WIDTH).max(1.0);
+    let content_w = (win_w - devtools_w).max(1.0);
     Rect {
         position: LogicalPosition::new(content_w, h).into(),
-        size: LogicalSize::new(DEVTOOLS_WIDTH, (win_h - h).max(1.0)).into(),
+        size: LogicalSize::new(devtools_w, (win_h - h).max(1.0)).into(),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn devtools_splitter_x(ww: f64, devtools_w: f64) -> f64 {
+    (ww - devtools_w).max(0.0)
+}
+
+#[cfg(target_os = "windows")]
+fn clamp_devtools_width(ww: f64, width: f64) -> f64 {
+    width.clamp(DEVTOOLS_WIDTH_MIN, (ww * 0.75).max(DEVTOOLS_WIDTH_MIN))
 }
 
 fn display_tab_title(title: &str) -> String {
@@ -1199,7 +1211,14 @@ const TOOLBAR_SCRIPT: &str = r#"
       bindBtn('close', () => post('win_close'));
 
       bindBtn('addtab-inline', () => post('new_tab:'));
-      bindBtn('addtab-fixed', () => post('new_tab:'));
+
+      const macDrag = document.getElementById('mac-drag');
+      if (macDrag) {
+        macDrag.addEventListener('pointerdown', (e) => {
+          e.preventDefault();
+          post('win_drag');
+        });
+      }
 
       const strip = document.getElementById('tab-strip');
       if (strip) {
@@ -1209,8 +1228,11 @@ const TOOLBAR_SCRIPT: &str = r#"
             e.preventDefault();
           }
         }, { passive: false });
+        const tabsBar = strip.closest('.tabs-bar');
         if (typeof ResizeObserver !== 'undefined') {
-          new ResizeObserver(() => layoutTabs()).observe(strip);
+          const ro = new ResizeObserver(() => layoutTabs());
+          ro.observe(strip);
+          if (tabsBar) ro.observe(tabsBar);
         }
       }
 
@@ -1265,6 +1287,26 @@ const TOOLBAR_SCRIPT: &str = r#"
     const TAB_GAP = 8;
     const SCROLL_TAB_GAP = 4;
 
+    function resetTabStyle(t) {
+      t.style.flex = '';
+      t.style.width = '';
+      t.style.minWidth = '';
+      t.style.maxWidth = '';
+      t.style.height = '';
+      t.style.margin = '';
+      t.style.padding = '';
+      t.style.boxSizing = '';
+    }
+
+    function tabStripAvailWidth(strip) {
+      const tabsBar = strip.closest('.tabs-bar');
+      if (!tabsBar) return strip.clientWidth;
+      const addBtn = tabsBar.querySelector('.addtab');
+      const addW = addBtn ? addBtn.offsetWidth : 32;
+      const barGap = 8;
+      return Math.max(0, tabsBar.clientWidth - addW - barGap);
+    }
+
     function layoutTabs() {
       const strip = document.getElementById('tab-strip');
       if (!strip) return;
@@ -1273,22 +1315,20 @@ const TOOLBAR_SCRIPT: &str = r#"
         const n = tabs.length;
         if (n === 0) return;
 
-        const avail = strip.clientWidth;
+        const avail = tabStripAvailWidth(strip);
         if (avail < 8) {
           requestAnimationFrame(() => layoutTabs());
           return;
         }
 
-        const tabsBar = strip.closest('.tabs-bar');
         strip.classList.remove('scroll');
         strip.style.gap = TAB_GAP + 'px';
-        if (tabsBar) tabsBar.classList.remove('scroll-mode');
+        tabs.forEach(resetTabStyle);
 
-        const minTotal = n * TAB_MIN + Math.max(0, n - 1) * TAB_GAP;
-        if (minTotal > avail) {
+        const scrollMinTotal = n * TAB_MIN + Math.max(0, n - 1) * SCROLL_TAB_GAP;
+        if (scrollMinTotal > avail) {
           strip.classList.add('scroll');
           strip.style.gap = SCROLL_TAB_GAP + 'px';
-          if (tabsBar) tabsBar.classList.add('scroll-mode');
           tabs.forEach(t => {
             t.style.flex = '0 0 32px';
             t.style.width = '32px';
@@ -1301,10 +1341,6 @@ const TOOLBAR_SCRIPT: &str = r#"
           });
           const active = strip.querySelector('.tab.active');
           if (active) active.scrollIntoView({ inline: 'nearest', block: 'nearest' });
-          const addInline = document.getElementById('addtab-inline');
-          const addFixed = document.getElementById('addtab-fixed');
-          if (addInline) addInline.style.display = 'none';
-          if (addFixed) addFixed.style.display = 'grid';
           return;
         }
 
@@ -1316,15 +1352,7 @@ const TOOLBAR_SCRIPT: &str = r#"
           t.style.minWidth = TAB_MIN + 'px';
           t.style.maxWidth = TAB_MAX + 'px';
           t.style.height = '32px';
-          t.style.margin = '';
-          t.style.padding = '';
-          t.style.boxSizing = '';
         });
-
-        const addInline = document.getElementById('addtab-inline');
-        const addFixed = document.getElementById('addtab-fixed');
-        if (addInline) addInline.style.display = 'grid';
-        if (addFixed) addFixed.style.display = 'none';
       });
     }
 
@@ -1462,13 +1490,15 @@ const TAB_BAR_CSS: &str = r#"
     }
     .tab-strip.scroll .tab-icon { width:16px !important; height:16px !important; margin:0 !important; flex:0 0 16px !important; }
     .tab-strip.scroll .tab-close {
-      position:absolute; left:0; right:0; top:50%; transform:translateY(-50%);
-      width:32px !important; height:32px !important; margin:0 auto;
-      border-radius:12px;
+      position:absolute; right:0; top:0;
+      width:14px !important; height:14px !important;
+      border-radius:6px; font-size:11px; line-height:1;
+      opacity:0; pointer-events:none;
     }
-    .tab-strip.scroll .tab:hover .tab-icon { opacity:0; }
-    .tab-strip.scroll .tab:hover .tab-close,
-    .tab-strip.scroll .tab.active .tab-close { opacity:1; pointer-events:auto; }
+    .tab-strip.scroll .tab.active .tab-close {
+      opacity:1; pointer-events:auto;
+      background:var(--b2);
+    }
     .omnibox-wrap { position:relative; flex:1; min-width:200px; display:flex; }
     .omnibox-wrap input {
       flex:1; min-width:0; padding:10px 34px 10px 14px; border-radius:16px;
@@ -1500,81 +1530,41 @@ const WIN_TAB_SCROLL_CSS: &str = r#"
     }
 "#;
 
-const WINDOWS_TAB_BAR_CSS: &str = r#"
-    .tabs-bar {
-      display:grid;
-      grid-template-columns:minmax(0,1fr) 36px;
-      align-items:start;
-      gap:8px;
-      height:40px;
-      min-height:40px;
-      max-height:40px;
-      padding-top:4px;
-      width:100%;
-      box-sizing:border-box;
-    }
-    .tabs-bar.scroll-mode {
-      display:flex !important;
-      align-items:flex-start;
-    }
-    .tabs-bar.scroll-mode .tab-strip {
-      flex:0 1 auto;
-      min-width:0;
-      max-width:calc(100% - 40px);
-      width:auto;
-    }
-    .tabs-bar.scroll-mode #addtab-inline,
-    .tabs-bar.scroll-mode #addtab-fixed {
-      flex:0 0 32px;
-      margin-left:0;
-    }
-    .tab-strip {
-      grid-column:1;
-      min-width:0;
-      width:100%;
-    }
-    #addtab-inline { grid-column:2; align-self:start; width:32px; height:32px; }
-    #addtab-fixed { grid-column:2; align-self:start; width:32px; height:32px; }
-    .toolbar { position:relative; }
-"#;
+const WINDOWS_TAB_BAR_CSS: &str = "";
 
-const MAC_TAB_STRIP_CSS: &str = r#"
-    .tabs-bar.scroll-mode {
-      display:flex !important;
-      align-items:flex-start;
-    }
-    .tabs-bar.scroll-mode .tab-strip {
-      flex:0 1 auto;
-      min-width:0;
-      max-width:calc(100% - 40px);
-      width:auto;
-    }
-    .tabs-bar.scroll-mode .addtab {
-      flex:0 0 32px;
-    }
-"#;
+const MAC_TAB_STRIP_CSS: &str = "";
 
 const WINDOWS_TAB_LAYOUT_SCRIPT: &str = r#"
 (function(){
-  var TAB_MIN=32,TAB_MAX=220,TAB_GAP=8;
+  var TAB_MIN=32,TAB_MAX=220,TAB_GAP=8,SCROLL_TAB_GAP=4;
+  function resetTabStyle(t){
+    t.style.flex='';t.style.width='';t.style.minWidth='';t.style.maxWidth='';t.style.height='';
+  }
+  function tabStripAvailWidth(strip){
+    var tabsBar=strip.closest('.tabs-bar');
+    if(!tabsBar)return strip.clientWidth;
+    var addBtn=tabsBar.querySelector('.addtab');
+    var addW=addBtn?addBtn.offsetWidth:32;
+    return Math.max(0,tabsBar.clientWidth-addW-8);
+  }
   function layoutTabs(){
     var strip=document.getElementById('tab-strip');
     if(!strip)return;
     var tabs=[].slice.call(strip.querySelectorAll('.tab'));
     var n=tabs.length;
     if(n===0)return;
-    var avail=strip.clientWidth;
+    var avail=tabStripAvailWidth(strip);
     if(avail<8){requestAnimationFrame(layoutTabs);return;}
     strip.classList.remove('scroll');
-    var minTotal=n*TAB_MIN+Math.max(0,n-1)*TAB_GAP;
-    if(minTotal>avail){
+    strip.style.gap=TAB_GAP+'px';
+    tabs.forEach(resetTabStyle);
+    var scrollMinTotal=n*TAB_MIN+Math.max(0,n-1)*SCROLL_TAB_GAP;
+    if(scrollMinTotal>avail){
       strip.classList.add('scroll');
+      strip.style.gap=SCROLL_TAB_GAP+'px';
       tabs.forEach(function(t){
-        t.style.flex='0 0 32px';
-        t.style.width='32px';
-        t.style.minWidth='32px';
-        t.style.maxWidth='32px';
-        t.style.height='32px';
+        t.style.flex='0 0 32px';t.style.width='32px';t.style.minWidth='32px';
+        t.style.maxWidth='32px';t.style.height='32px';
       });
       var active=strip.querySelector('.tab.active');
       if(active)active.scrollIntoView({inline:'nearest',block:'nearest'});
@@ -1583,11 +1573,8 @@ const WINDOWS_TAB_LAYOUT_SCRIPT: &str = r#"
     var width=Math.floor((avail-Math.max(0,n-1)*TAB_GAP)/n);
     width=Math.min(TAB_MAX,Math.max(TAB_MIN,width));
     tabs.forEach(function(t){
-      t.style.flex='1 1 0';
-      t.style.width=width+'px';
-      t.style.minWidth=TAB_MIN+'px';
-      t.style.maxWidth=TAB_MAX+'px';
-      t.style.height='32px';
+      t.style.flex='1 1 0';t.style.width=width+'px';t.style.minWidth=TAB_MIN+'px';
+      t.style.maxWidth=TAB_MAX+'px';t.style.height='32px';
     });
   }
   layoutTabs();
@@ -1596,10 +1583,15 @@ const WINDOWS_TAB_LAYOUT_SCRIPT: &str = r#"
   if(strip){
     strip.addEventListener('wheel',function(e){
       if(Math.abs(e.deltaY)>Math.abs(e.deltaX)){
-        strip.scrollLeft+=e.deltaY;
-        e.preventDefault();
+        strip.scrollLeft+=e.deltaY;e.preventDefault();
       }
     },{passive:false});
+    var tabsBar=strip.closest('.tabs-bar');
+    if(typeof ResizeObserver!=='undefined'){
+      var ro=new ResizeObserver(layoutTabs);
+      ro.observe(strip);
+      if(tabsBar)ro.observe(tabsBar);
+    }
   }
 })();
 "#;
@@ -1747,7 +1739,11 @@ fn toolbar_html() -> String {
     html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#202124; }}
     body {{ background:var(--bg); color:var(--fg); font:14px/1.2 system-ui,"Segoe UI",Arial; }}
     .chrome {{ height:var(--toolbarH); display:flex; flex-direction:column; }}
-    .tabs-wrap {{ padding:28px 12px 0; -webkit-app-region:drag; }}
+    .mac-drag-bar {{
+      position:fixed; top:0; left:0; right:0; height:28px;
+      -webkit-app-region:drag; z-index:10;
+    }}
+    .tabs-wrap {{ padding:28px 12px 0; -webkit-app-region:no-drag; }}
     {tab_bar_css}
     .tabs-bar {{ -webkit-app-region:no-drag; }}
     .addtab, .tab, .navbtn, .omnibox-wrap, input, .url-clear {{ -webkit-app-region:no-drag; }}
@@ -1762,11 +1758,11 @@ fn toolbar_html() -> String {
 </head>
 <body class="platform-mac">
   <div class="chrome">
+    <div class="mac-drag-bar" id="mac-drag"></div>
     <div class="tabs-wrap">
       <div class="tabs-bar">
         <div class="tab-strip" id="tab-strip"></div>
         <div class="addtab" id="addtab-inline" title="Новая вкладка">+</div>
-        <div class="addtab" id="addtab-fixed" title="Новая вкладка" style="display:none">+</div>
       </div>
     </div>
     <div class="nav-row">
@@ -1785,7 +1781,7 @@ fn toolbar_html() -> String {
 </body>
 </html>"#,
             script = TOOLBAR_SCRIPT,
-            tab_bar_css = format!("{TAB_BAR_CSS}\n{MAC_TAB_BAR_CSS}\n{MAC_TAB_STRIP_CSS}"),
+            tab_bar_css = format!("{TAB_BAR_CSS}\n{MAC_TAB_BAR_CSS}"),
             omnibox_placeholder = OMNIBOX_PLACEHOLDER,
             browser_icon = json!(browser_icon_data_url()),
         );
@@ -1851,7 +1847,6 @@ fn toolbar_html() -> String {
       <div class="tabs-bar">
         <div class="tab-strip" id="tab-strip"></div>
         <div class="addtab" id="addtab-inline" title="Новая вкладка">+</div>
-        <div class="addtab" id="addtab-fixed" title="Новая вкладка" style="display:none">+</div>
       </div>
       <div class="row">
         <div class="navbtn" id="back" title="Назад">←</div>
@@ -1889,6 +1884,7 @@ fn build_content_webview(
     wh: f64,
     visible: bool,
     devtools_open: bool,
+    devtools_width: f64,
     #[cfg(target_os = "windows")] webview_env_from: Option<&WebView>,
 ) -> WebView {
     #[cfg(target_os = "windows")]
@@ -1900,7 +1896,7 @@ fn build_content_webview(
 
     let builder = WebViewBuilder::new()
         .with_user_agent(content_user_agent())
-        .with_bounds(bounds_content(ww, wh, devtools_open))
+        .with_bounds(bounds_content(ww, wh, devtools_open, devtools_width))
         .with_visible(visible)
         .with_background_color((15, 17, 21, 255))
         .with_focused(if cfg!(target_os = "windows") { false } else { visible })
@@ -2048,16 +2044,17 @@ fn resize_all(
     ww: f64,
     wh: f64,
     devtools_open: bool,
+    devtools_width: f64,
     #[cfg(target_os = "windows")] devtools_panel: Option<&WebView>,
 ) {
     let _ = toolbar.set_bounds(bounds_toolbar(ww));
-    let bounds = bounds_content(ww, wh, devtools_open);
+    let bounds = bounds_content(ww, wh, devtools_open, devtools_width);
     for tab in tabs {
         let _ = tab.webview.set_bounds(bounds);
     }
     #[cfg(target_os = "windows")]
     if let Some(panel) = devtools_panel {
-        let _ = panel.set_bounds(bounds_devtools_panel(ww, wh));
+        let _ = panel.set_bounds(bounds_devtools_panel(ww, wh, devtools_width));
         let _ = panel.set_visible(devtools_open);
     }
     #[cfg(target_os = "windows")]
@@ -2085,6 +2082,7 @@ fn toggle_devtools(
     devtools_open: &mut bool,
     ww: f64,
     wh: f64,
+    devtools_width: f64,
     #[cfg(target_os = "windows")] devtools_panel: Option<&WebView>,
 ) {
     let Some(tab) = tabs.get(current) else {
@@ -2113,6 +2111,7 @@ fn toggle_devtools(
             ww,
             wh,
             *devtools_open,
+            devtools_width,
             devtools_panel,
         );
         raise_toolbar(
@@ -2142,6 +2141,7 @@ fn toggle_devtools(
             ww,
             wh,
             *devtools_open,
+            DEVTOOLS_WIDTH_DEFAULT,
         );
         raise_toolbar(
             toolbar,
@@ -2308,13 +2308,14 @@ fn build_devtools_panel(
     window: &Window,
     ww: f64,
     wh: f64,
+    devtools_width: f64,
     webview_env_from: &WebView,
 ) -> WebView {
     use wry::{WebViewBuilderExtWindows, WebViewExtWindows};
 
     WebViewBuilder::new()
         .with_html(DEVTOOLS_PANEL_HTML)
-        .with_bounds(bounds_devtools_panel(ww, wh))
+        .with_bounds(bounds_devtools_panel(ww, wh, devtools_width))
         .with_background_color((30, 30, 30, 255))
         .with_visible(false)
         .with_devtools(false)
@@ -2343,6 +2344,7 @@ fn open_new_tab(
     ww: f64,
     wh: f64,
     devtools_open: bool,
+    devtools_width: f64,
     #[cfg(target_os = "windows")] devtools_panel: Option<&WebView>,
 ) {
     for tab in tabs.iter() {
@@ -2367,6 +2369,7 @@ fn open_new_tab(
         wh,
         false,
         devtools_open,
+        devtools_width,
         #[cfg(target_os = "windows")]
         Some(toolbar),
     );
@@ -2397,6 +2400,7 @@ fn open_new_tab(
         ww,
         wh,
         devtools_open,
+        devtools_width,
         #[cfg(target_os = "windows")]
         devtools_panel,
     );
@@ -2421,6 +2425,10 @@ struct WindowsRunState {
     ww: f64,
     wh: f64,
     devtools_open: bool,
+    devtools_width: f64,
+    devtools_resizing: bool,
+    cursor_x: f64,
+    cursor_y: f64,
     modifiers: ModifiersState,
     z_order_nudges: u32,
     proxy: EventLoopProxy<UserEvent>,
@@ -2591,6 +2599,7 @@ fn tick_devtools_panel_build(app: &mut WindowsRunState) {
         &app.window,
         app.ww,
         app.wh,
+        app.devtools_width,
         &app.toolbar,
     ));
     resize_all(
@@ -2600,6 +2609,7 @@ fn tick_devtools_panel_build(app: &mut WindowsRunState) {
         app.ww,
         app.wh,
         app.devtools_open,
+        app.devtools_width,
         app.devtools_panel.as_ref(),
     );
     raise_toolbar(
@@ -2743,6 +2753,7 @@ unsafe fn drain_pending_ipc(app_ptr: WinAppPtr, control_flow: &mut ControlFlow) 
                 ww: &mut app.ww,
                 wh: &mut app.wh,
                 devtools_open: &mut app.devtools_open,
+                devtools_width: &mut app.devtools_width,
                 devtools_panel: app.devtools_panel.as_ref(),
             };
             process_ipc(&msg, &mut ctx);
@@ -2874,6 +2885,7 @@ fn drain_open_tab_queue(
     ww: f64,
     wh: f64,
     devtools_open: bool,
+    devtools_width: f64,
     #[cfg(target_os = "windows")] devtools_panel: Option<&WebView>,
 ) {
     if TAB_BUILDING.load(Ordering::SeqCst) {
@@ -2900,6 +2912,7 @@ fn drain_open_tab_queue(
         ww,
         wh,
         devtools_open,
+        devtools_width,
         #[cfg(target_os = "windows")]
         devtools_panel,
     );
@@ -2924,6 +2937,7 @@ struct IpcContext<'a> {
     ww: &'a mut f64,
     wh: &'a mut f64,
     devtools_open: &'a mut bool,
+    devtools_width: &'a mut f64,
     #[cfg(target_os = "windows")]
     devtools_panel: Option<&'a WebView>,
 }
@@ -2945,6 +2959,7 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
                 *ctx.ww,
                 *ctx.wh,
                 *ctx.devtools_open,
+                *ctx.devtools_width,
                 #[cfg(target_os = "windows")]
                 ctx.devtools_panel,
             );
@@ -3020,6 +3035,7 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
                 ctx.devtools_open,
                 *ctx.ww,
                 *ctx.wh,
+                *ctx.devtools_width,
                 #[cfg(target_os = "windows")]
                 ctx.devtools_panel,
             );
@@ -3129,8 +3145,15 @@ fn dispatch_app_event(
     ww: &mut f64,
     wh: &mut f64,
     devtools_open: &mut bool,
+    devtools_width: &mut f64,
     modifiers: &mut ModifiersState,
     z_order_nudges: Option<&mut u32>,
+    #[cfg(target_os = "windows")]
+    devtools_resizing: &mut bool,
+    #[cfg(target_os = "windows")]
+    cursor_x: &mut f64,
+    #[cfg(target_os = "windows")]
+    cursor_y: &mut f64,
 ) {
     match event {
         Event::WindowEvent { event, .. } => match event {
@@ -3146,6 +3169,7 @@ fn dispatch_app_event(
                     *ww,
                     *wh,
                     *devtools_open,
+                    *devtools_width,
                     #[cfg(target_os = "windows")]
                     devtools_panel,
                 );
@@ -3161,12 +3185,50 @@ fn dispatch_app_event(
 
             #[cfg(target_os = "windows")]
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some(panel) = devtools_panel {
-                    let scale = window.scale_factor();
-                    let y = position.to_logical::<f64>(scale).y;
-                    if y < toolbar_height() {
+                let scale = window.scale_factor();
+                let logical = position.to_logical::<f64>(scale);
+                *cursor_x = logical.x;
+                *cursor_y = logical.y;
+                if *devtools_resizing && *devtools_open {
+                    let new_w = clamp_devtools_width(*ww, *ww - logical.x);
+                    if (new_w - *devtools_width).abs() > 0.5 {
+                        *devtools_width = new_w;
+                        resize_all(
+                            window,
+                            toolbar,
+                            tabs,
+                            *ww,
+                            *wh,
+                            *devtools_open,
+                            *devtools_width,
+                            devtools_panel,
+                        );
+                        raise_toolbar(toolbar, window, Some(tabs), devtools_panel);
+                    }
+                } else if let Some(panel) = devtools_panel {
+                    if logical.y < toolbar_height() {
                         raise_toolbar(toolbar, window, Some(tabs), Some(panel));
                         let _ = toolbar.focus();
+                    }
+                }
+            }
+
+            #[cfg(target_os = "windows")]
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    match state {
+                        ElementState::Pressed => {
+                            if *devtools_open && *cursor_y >= toolbar_height() {
+                                let split_x = devtools_splitter_x(*ww, *devtools_width);
+                                if (*cursor_x - split_x).abs() <= DEVTOOLS_SPLITTER_HIT {
+                                    *devtools_resizing = true;
+                                }
+                            }
+                        }
+                        ElementState::Released => {
+                            *devtools_resizing = false;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -3183,6 +3245,7 @@ fn dispatch_app_event(
                     *ww,
                     *wh,
                     *devtools_open,
+                    *devtools_width,
                     #[cfg(target_os = "windows")]
                     devtools_panel,
                 );
@@ -3227,6 +3290,7 @@ fn dispatch_app_event(
                         devtools_open,
                         *ww,
                         *wh,
+                        *devtools_width,
                         #[cfg(target_os = "windows")]
                         devtools_panel,
                     );
@@ -3252,6 +3316,7 @@ fn dispatch_app_event(
                 *ww,
                 *wh,
                 *devtools_open,
+                *devtools_width,
                 #[cfg(target_os = "windows")]
                 devtools_panel,
             );
@@ -3266,6 +3331,7 @@ fn dispatch_app_event(
                 devtools_open,
                 *ww,
                 *wh,
+                *devtools_width,
                 #[cfg(target_os = "windows")]
                 devtools_panel,
             );
@@ -3384,6 +3450,7 @@ fn dispatch_app_event(
                 ww,
                 wh,
                 devtools_open,
+                devtools_width,
                 #[cfg(target_os = "windows")]
                 devtools_panel: devtools_panel,
             };
@@ -3402,6 +3469,7 @@ fn dispatch_app_event(
                 *ww,
                 *wh,
                 *devtools_open,
+                *devtools_width,
                 devtools_panel,
             );
             if let Some(nudges) = z_order_nudges {
@@ -3426,6 +3494,7 @@ fn dispatch_app_event(
                 *ww,
                 *wh,
                 *devtools_open,
+                *devtools_width,
             );
         }
 
@@ -3492,6 +3561,7 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
                 app.wh,
                 false,
                 app.devtools_open,
+                app.devtools_width,
                 Some(&app.toolbar),
             );
             app.tabs.push(Tab {
@@ -3515,6 +3585,7 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
                     &app.window,
                     app.ww,
                     app.wh,
+                    app.devtools_width,
                     &app.toolbar,
                 ));
             }
@@ -3537,6 +3608,7 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
                 app.ww,
                 app.wh,
                 app.devtools_open,
+                app.devtools_width,
                 app.devtools_panel.as_ref(),
             );
             sync_toolbar(&app.toolbar, &app.tabs, app.current);
@@ -3600,8 +3672,12 @@ fn run_windows_app(
                 &mut app.ww,
                 &mut app.wh,
                 &mut app.devtools_open,
+                &mut app.devtools_width,
                 &mut app.modifiers,
                 Some(&mut app.z_order_nudges),
+                &mut app.devtools_resizing,
+                &mut app.cursor_x,
+                &mut app.cursor_y,
             );
             tick_devtools_panel_build(app);
         }
@@ -3682,6 +3758,10 @@ fn main() {
                 ww,
                 wh,
                 devtools_open,
+                devtools_width: DEVTOOLS_WIDTH_DEFAULT,
+                devtools_resizing: false,
+                cursor_x: 0.0,
+                cursor_y: 0.0,
                 modifiers,
                 z_order_nudges: 0,
                 proxy,
@@ -3694,6 +3774,7 @@ fn main() {
 
     #[cfg(not(target_os = "windows"))]
     {
+        let mut devtools_width = DEVTOOLS_WIDTH_DEFAULT;
         let first_webview = build_content_webview(
             &window,
             proxy.clone(),
@@ -3703,6 +3784,7 @@ fn main() {
             wh,
             true,
             devtools_open,
+            devtools_width,
         );
         next_id += 1;
 
@@ -3728,6 +3810,7 @@ fn main() {
             ww,
             wh,
             devtools_open,
+            devtools_width,
         );
 
         sync_toolbar(&toolbar, &tabs, current);
@@ -3747,6 +3830,7 @@ fn main() {
                 &mut ww,
                 &mut wh,
                 &mut devtools_open,
+                &mut devtools_width,
                 &mut modifiers,
                 None,
             );
