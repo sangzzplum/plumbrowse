@@ -216,17 +216,15 @@ fn sync_windows_z_order(
     if let Some(panel) = devtools_panel {
         if let Some(host) = webview_host_hwnd(panel) {
             unsafe {
-                use windows::Win32::UI::WindowsAndMessaging::BringWindowToTop;
                 let _ = SetWindowPos(
                     host,
-                    Some(HWND_TOP),
+                    Some(HWND_BOTTOM),
                     0,
                     0,
                     0,
                     0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
                 );
-                let _ = BringWindowToTop(host);
             }
         }
     }
@@ -1708,6 +1706,7 @@ fn build_content_webview(
         .with_user_agent(content_user_agent())
         .with_bounds(bounds_content(ww, wh, devtools_open))
         .with_visible(visible)
+        .with_background_color((15, 17, 21, 255))
         .with_focused(if cfg!(target_os = "windows") { false } else { visible })
         .with_clipboard(true)
         .with_back_forward_navigation_gestures(true)
@@ -1781,9 +1780,7 @@ fn build_content_webview(
         });
 
     #[cfg(target_os = "windows")]
-    let builder = builder
-        .with_browser_accelerator_keys(false)
-        .with_additional_browser_args("--remote-debugging-port=9222");
+    let builder = builder.with_browser_accelerator_keys(false);
 
     let is_newtab = url == NEWTAB_URL || is_internal_newtab_url(url);
     let webview = if is_newtab {
@@ -2118,7 +2115,7 @@ struct WindowsRunState {
     modifiers: ModifiersState,
     z_order_nudges: u32,
     proxy: EventLoopProxy<UserEvent>,
-    /// 0 = pending, 1 = window shown, 2 = bootstrap complete
+    /// 0 = show window, 1 = ipc ready, 2 = bootstrap complete
     bootstrap_phase: u8,
     startup_focus_frames: u32,
 }
@@ -2926,8 +2923,10 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
             app.window.set_visible(true);
             focus_main_window(&app.window);
             app.startup_focus_frames = 120;
+            // Toolbar IPC must work before content webview creation (WebView2 can block the loop).
+            WIN_IPC_READY.store(true, Ordering::SeqCst);
             app.bootstrap_phase = 1;
-            log_windows_debug("bootstrap: window shown (phase 0)");
+            log_windows_debug("bootstrap: window shown, ipc ready (phase 0)");
         }
         1 => {
             win_startup("bootstrap: content webview");
@@ -2969,7 +2968,6 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
             );
             sync_toolbar(&app.toolbar, &app.tabs, app.current);
             log_windows_layout(&app.toolbar, &app.tabs, "startup");
-            WIN_IPC_READY.store(true, Ordering::SeqCst);
             flush_toolbar(&app.toolbar);
             app.bootstrap_phase = 2;
             log_windows_debug("bootstrap complete");
@@ -3006,9 +3004,9 @@ fn run_windows_app(
         }
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
         unsafe {
+            drain_pending_ipc(app_ptr, control_flow);
             bootstrap_win_app(win_app_mut(app_ptr));
             tick_startup_focus(win_app_mut(app_ptr));
-            drain_pending_ipc(app_ptr, control_flow);
             tick_devtools_connect(win_app_mut(app_ptr));
         }
         if *control_flow == ControlFlow::Exit {
