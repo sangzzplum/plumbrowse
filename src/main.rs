@@ -216,15 +216,17 @@ fn sync_windows_z_order(
     if let Some(panel) = devtools_panel {
         if let Some(host) = webview_host_hwnd(panel) {
             unsafe {
+                use windows::Win32::UI::WindowsAndMessaging::BringWindowToTop;
                 let _ = SetWindowPos(
                     host,
-                    Some(HWND_BOTTOM),
+                    Some(HWND_TOP),
                     0,
                     0,
                     0,
                     0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
                 );
+                let _ = BringWindowToTop(host);
             }
         }
     }
@@ -388,6 +390,7 @@ fn webview_go_forward(webview: &WebView) {
 }
 
 const NEWTAB_URL: &str = "plum://newtab";
+const OMNIBOX_PLACEHOLDER: &str = "Введите адрес или выполните поиск";
 const DEVTOOLS_WIDTH: f64 = 420.0;
 const TOOLBAR_BG: RGBA = (32, 33, 36, 255);
 
@@ -697,6 +700,11 @@ fn resolve_omnibox_input(input: &str) -> Option<String> {
     ))
 }
 
+fn is_plum_newtab_http_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.starts_with("http://plum.newtab") || lower.starts_with("https://plum.newtab")
+}
+
 fn is_internal_newtab_url(url: &str) -> bool {
     let u = url.trim();
     if u.is_empty() || u == "about:blank" || u.starts_with("data:text/html") {
@@ -706,9 +714,7 @@ fn is_internal_newtab_url(url: &str) -> bool {
         return true;
     }
     let lower = u.to_lowercase();
-    lower == "plum.newtab"
-        || lower.starts_with("http://plum.newtab")
-        || lower.starts_with("https://plum.newtab")
+    lower == "plum.newtab" || is_plum_newtab_http_url(u)
 }
 
 fn is_blocked_plum_http_url(url: &str) -> bool {
@@ -988,27 +994,84 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Новая вкладка</title>
   <style>
-    :root { --bg:#0f1115; --fg:#e8eaed; --mut:#9aa0a6; --card:#171a21; }
-    body{
-      margin:0; height:100vh; display:grid; place-items:center;
-      background:radial-gradient(1200px 600px at 50% 20%, #1b2333, var(--bg));
-      color:var(--fg); font:16px/1.35 system-ui, Segoe UI, Arial;
+    :root { --bg:#0f1115; --fg:#e8eaed; --mut:#9aa0a6; --accent:#8ab4f8; }
+    * { box-sizing:border-box; }
+    html, body { margin:0; height:100%; }
+    body {
+      display:flex; flex-direction:column; align-items:center; justify-content:center;
+      background:radial-gradient(1200px 600px at 50% 18%, #1b2333, var(--bg));
+      color:var(--fg); font:16px/1.4 system-ui, "Segoe UI", Arial, sans-serif;
+      padding:24px;
     }
-    .wrap{ width:min(720px, 92vw); }
-    .logo{ font-size:34px; font-weight:800; margin-bottom:14px; }
-    .hint{ color:var(--mut); margin-bottom:18px; }
-    .card{ background:rgba(23,26,33,0.82); border:1px solid rgba(255,255,255,0.06); border-radius:18px; padding:18px; }
+    .brand { font-size:42px; font-weight:700; letter-spacing:-0.02em; margin-bottom:28px; }
+    .search-form { width:min(560px, 92vw); }
+    .search-box {
+      display:flex; align-items:center; gap:10px;
+      background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1);
+      border-radius:28px; padding:6px 8px 6px 18px;
+      box-shadow:0 8px 32px rgba(0,0,0,0.25);
+    }
+    .search-box:focus-within { border-color:rgba(138,180,248,0.55); }
+    .search-box input {
+      flex:1; border:none; outline:none; background:transparent;
+      color:var(--fg); font:inherit; padding:10px 0;
+    }
+    .search-box input::placeholder { color:var(--mut); }
+    .search-box button {
+      border:none; border-radius:20px; background:var(--accent); color:#0f1115;
+      font:inherit; font-weight:600; padding:10px 18px; cursor:pointer;
+    }
+    .search-box button:hover { filter:brightness(1.05); }
+    .hint { margin-top:18px; color:var(--mut); font-size:14px; text-align:center; }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="logo">PlumBrowser</div>
-    <div class="hint">Введите адрес в строку поиска выше.</div>
-    <div class="card">Кликайте по ссылки — URL обновится автоматически. Cmd+клик и target="_blank" откроют новую вкладку.</div>
-  </div>
+  <div class="brand">PlumBrowser</div>
+  <form class="search-form" id="search-form">
+    <div class="search-box">
+      <input id="search" type="search" autocomplete="off" spellcheck="false"
+        placeholder="Введите адрес или выполните поиск" autofocus />
+      <button type="submit">Перейти</button>
+    </div>
+  </form>
+  <div class="hint">Или используйте строку адреса вверху окна</div>
+  <script>
+    function post(msg) {
+      try {
+        if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+          window.chrome.webview.postMessage(msg);
+          return;
+        }
+      } catch (e) {}
+      try {
+        if (window.ipc && window.ipc.postMessage) {
+          window.ipc.postMessage(msg);
+        }
+      } catch (e2) {}
+    }
+    function navigate(input) {
+      var q = (input || '').trim();
+      if (!q) return;
+      post('load:' + q);
+    }
+    document.getElementById('search-form').addEventListener('submit', function(e) {
+      e.preventDefault();
+      navigate(document.getElementById('search').value);
+    });
+  </script>
 </body>
 </html>
 "#;
+
+fn newtab_data_url() -> &'static str {
+    static URL: OnceLock<String> = OnceLock::new();
+    URL.get_or_init(|| {
+        format!(
+            "data:text/html;charset=utf-8,{}",
+            percent_encode_ipc_path(NEWTAB_HTML)
+        )
+    })
+}
 
 const TOOLBAR_SCRIPT: &str = r#"
     function post(msg) {
@@ -1256,7 +1319,7 @@ const TAB_BAR_CSS: &str = r#"
     .tab {
       position:relative;
       display:flex; align-items:center; gap:6px;
-      height:32px; padding:0 28px 0 8px; border-radius:12px; background:var(--b);
+      height:32px; padding:0 34px 0 8px; border-radius:12px; background:var(--b);
       cursor:pointer; user-select:none; box-sizing:border-box;
     }
     .tab.active { background:var(--b2); }
@@ -1266,7 +1329,7 @@ const TAB_BAR_CSS: &str = r#"
       text-overflow:ellipsis; flex:1 1 auto;
     }
     .tab-close {
-      position:absolute; right:6px; top:4px;
+      position:absolute; right:4px; top:4px;
       width:24px; height:24px; border-radius:10px;
       display:grid; place-items:center; color:var(--mut); font-weight:900;
       opacity:0; pointer-events:none;
@@ -1298,6 +1361,54 @@ const WINDOWS_TAB_BAR_CSS: &str = r#"
     #addtab-inline { grid-column:2; }
     #addtab-fixed { grid-column:2; }
     .toolbar { position:relative; }
+"#;
+
+const WINDOWS_TAB_LAYOUT_SCRIPT: &str = r#"
+(function(){
+  var TAB_MIN=32,TAB_MAX=220,TAB_GAP=8;
+  function layoutTabs(){
+    var strip=document.getElementById('tab-strip');
+    if(!strip)return;
+    var tabs=[].slice.call(strip.querySelectorAll('.tab'));
+    var n=tabs.length;
+    if(n===0)return;
+    var avail=strip.clientWidth;
+    if(avail<8){requestAnimationFrame(layoutTabs);return;}
+    strip.classList.remove('scroll');
+    var minTotal=n*TAB_MIN+Math.max(0,n-1)*TAB_GAP;
+    if(minTotal>avail){
+      strip.classList.add('scroll');
+      tabs.forEach(function(t){
+        t.style.flex='0 0 '+TAB_MIN+'px';
+        t.style.width=TAB_MIN+'px';
+        t.style.minWidth=TAB_MIN+'px';
+        t.style.maxWidth=TAB_MIN+'px';
+      });
+      var active=strip.querySelector('.tab.active');
+      if(active)active.scrollIntoView({inline:'nearest',block:'nearest'});
+      return;
+    }
+    var width=Math.floor((avail-Math.max(0,n-1)*TAB_GAP)/n);
+    width=Math.min(TAB_MAX,Math.max(TAB_MIN,width));
+    tabs.forEach(function(t){
+      t.style.flex='1 1 0';
+      t.style.width=width+'px';
+      t.style.minWidth=TAB_MIN+'px';
+      t.style.maxWidth=TAB_MAX+'px';
+    });
+  }
+  layoutTabs();
+  window.addEventListener('resize',layoutTabs);
+  var strip=document.getElementById('tab-strip');
+  if(strip){
+    strip.addEventListener('wheel',function(e){
+      if(Math.abs(e.deltaY)>Math.abs(e.deltaX)){
+        strip.scrollLeft+=e.deltaY;
+        e.preventDefault();
+      }
+    },{passive:false});
+  }
+})();
 "#;
 
 /// Server-rendered toolbar for Windows — tabs and buttons use inline navigation IPC (no JS required).
@@ -1387,20 +1498,6 @@ fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
     }}
     .go {{ padding:10px 14px; border-radius:16px; background:var(--b); cursor:pointer; user-select:none; flex:0 0 auto; }}
     .go:hover {{ background:var(--b2); }}
-    .tab {{
-      position:relative;
-      display:flex; align-items:center; gap:6px;
-      height:32px; min-width:80px; padding:0 28px 0 8px; border-radius:12px; background:var(--b);
-      cursor:pointer; user-select:none; box-sizing:border-box; color:var(--fg);
-    }}
-    .tab.active {{ background:var(--b2); }}
-    .tab-icon {{ flex:0 0 auto; width:16px; height:16px; border-radius:4px; display:block; }}
-    .tab-title {{ min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; flex:1 1 auto; }}
-    .tab-close {{
-      position:absolute; right:6px; top:4px;
-      width:24px; height:24px; border-radius:10px;
-      display:grid; place-items:center; color:var(--mut); font-weight:900;
-    }}
   </style>
 </head>
 <body>
@@ -1423,15 +1520,18 @@ fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
         <div class="navbtn" title="Вперёд" onclick="window.location.replace('{nav_forward}')">→</div>
         <div class="navbtn" title="{nav_reload_title}" onclick="window.location.replace('{nav_reload_action}')">{nav_reload_label}</div>
         <div class="navbtn" title="Инструменты разработчика (F12)" onclick="window.location.replace('{nav_devtools}')">&#123; &#125;</div>
-        <input id="url" value="{cur_url_attr}" placeholder="адрес или поиск" autocomplete="off" spellcheck="false"
+        <input id="url" value="{cur_url_attr}" placeholder="{omnibox_placeholder}" autocomplete="off" spellcheck="false"
           onkeydown="if(event.key==='Enter')window.location.replace('plum://ipc/load:'+encodeURIComponent(this.value))" />
-        <div class="go" onclick="window.location.replace('plum://ipc/load:'+encodeURIComponent(document.getElementById('url').value))">Go</div>
+        <div class="go" onclick="window.location.replace('plum://ipc/load:'+encodeURIComponent(document.getElementById('url').value))">Перейти</div>
       </div>
     </div>
   </div>
+  <script>{tab_layout_script}</script>
 </body>
 </html>"#,
         tab_bar_css = format!("{TAB_BAR_CSS}\n{WINDOWS_TAB_BAR_CSS}"),
+        omnibox_placeholder = OMNIBOX_PLACEHOLDER,
+        tab_layout_script = WINDOWS_TAB_LAYOUT_SCRIPT,
     )
 }
 
@@ -1490,8 +1590,8 @@ fn toolbar_html() -> String {
       <div class="navbtn" id="forward" title="Вперёд">→</div>
       <div class="navbtn" id="reload" title="Обновить">↻</div>
       <div class="navbtn" id="devtools" title="Инструменты разработчика (F12)">&#123; &#125;</div>
-      <input id="url" placeholder="example.com или https://example.com" autocomplete="off" spellcheck="false" />
-      <div class="go" id="go">Go</div>
+      <input id="url" placeholder="{omnibox_placeholder}" autocomplete="off" spellcheck="false" />
+      <div class="go" id="go">Перейти</div>
     </div>
   </div>
   <script>window.__plumBrowserIcon={browser_icon};</script>
@@ -1500,6 +1600,7 @@ fn toolbar_html() -> String {
 </html>"#,
             script = TOOLBAR_SCRIPT,
             tab_bar_css = TAB_BAR_CSS,
+            omnibox_placeholder = OMNIBOX_PLACEHOLDER,
             browser_icon = json!(browser_icon_data_url()),
         );
     }
@@ -1571,8 +1672,8 @@ fn toolbar_html() -> String {
         <div class="navbtn" id="forward" title="Вперёд">→</div>
         <div class="navbtn" id="reload" title="Обновить">↻</div>
         <div class="navbtn" id="devtools" title="Инструменты разработчика (F12)">&#123; &#125;</div>
-        <input id="url" placeholder="адрес или поиск" autocomplete="off" spellcheck="false" />
-        <div class="go" id="go">Go</div>
+        <input id="url" placeholder="{omnibox_placeholder}" autocomplete="off" spellcheck="false" />
+        <div class="go" id="go">Перейти</div>
       </div>
     </div>
   </div>
@@ -1583,6 +1684,7 @@ fn toolbar_html() -> String {
         script = TOOLBAR_SCRIPT,
         tab_bar_css = format!("{TAB_BAR_CSS}\n{WINDOWS_TAB_BAR_CSS}"),
         version = version_label(),
+        omnibox_placeholder = OMNIBOX_PLACEHOLDER,
         browser_icon = json!(browser_icon_data_url()),
     )
 }
@@ -1616,8 +1718,14 @@ fn build_content_webview(
         .with_ipc_handler({
             let proxy = proxy.clone();
             move |req: Request<String>| {
-                if req.body() == "toggle_devtools" {
-                    let _ = proxy.send_event(UserEvent::ToggleDevtools);
+                match req.body().as_str() {
+                    "toggle_devtools" => {
+                        let _ = proxy.send_event(UserEvent::ToggleDevtools);
+                    }
+                    body if body.starts_with("load:") => {
+                        let _ = proxy.send_event(UserEvent::Ipc(body.to_string()));
+                    }
+                    _ => {}
                 }
             }
         })
@@ -1638,9 +1746,13 @@ fn build_content_webview(
         .with_navigation_handler({
             let proxy = proxy.clone();
             move |nav_url| {
-                if is_blocked_plum_http_url(&nav_url)
-                    || (is_internal_newtab_url(&nav_url) && !nav_url.starts_with("plum://"))
-                {
+                if nav_url == "about:blank" {
+                    return true;
+                }
+                if is_blocked_plum_http_url(&nav_url) {
+                    return false;
+                }
+                if is_plum_newtab_http_url(&nav_url) {
                     let _ = proxy.send_event(UserEvent::ForceLoad {
                         tab_id,
                         url: NEWTAB_URL.to_string(),
@@ -1649,7 +1761,7 @@ fn build_content_webview(
                 }
                 let _ = proxy.send_event(UserEvent::Navigated {
                     tab_id,
-                    url: nav_url,
+                    url: nav_url.to_string(),
                 });
                 true
             }
@@ -1670,12 +1782,13 @@ fn build_content_webview(
 
     #[cfg(target_os = "windows")]
     let builder = builder
-        .with_browser_accelerator_keys(false);
+        .with_browser_accelerator_keys(false)
+        .with_additional_browser_arguments("--remote-debugging-port=9222");
 
-    #[cfg(target_os = "windows")]
-    let webview = if url == NEWTAB_URL {
+    let is_newtab = url == NEWTAB_URL || is_internal_newtab_url(url);
+    let webview = if is_newtab {
         builder
-            .with_url(NEWTAB_URL)
+            .with_html(NEWTAB_HTML)
             .build_as_child(window)
             .expect("failed to build content webview")
     } else {
@@ -1684,12 +1797,6 @@ fn build_content_webview(
             .build_as_child(window)
             .expect("failed to build content webview")
     };
-
-    #[cfg(not(target_os = "windows"))]
-    let webview = builder
-        .with_url(url)
-        .build_as_child(window)
-        .expect("failed to build content webview");
 
     webview
 }
@@ -2072,13 +2179,36 @@ fn tick_devtools_connect(app: &mut WindowsRunState) {
     if let Some(url) = win_devtools::inspector_url_for_page(&state.page_url) {
         log_windows_debug("devtools: inspector ready");
         let _ = panel.load_url(&url);
+        let _ = panel.set_visible(true);
+        raise_toolbar(
+            &app.toolbar,
+            &app.window,
+            Some(&app.tabs),
+            app.devtools_panel.as_ref(),
+        );
         *slot = None;
         return;
     }
 
     state.attempts += 1;
     if state.attempts >= DEVTOOLS_CONNECT_MAX {
-        log_windows_debug("devtools: CDP connect timed out (is port 9222 up?)");
+        log_windows_debug("devtools: CDP connect timed out, opening DevTools window");
+        if let Some(tab) = app.tabs.get(app.current) {
+            tab.webview.open_devtools();
+        }
+        if let Some(panel) = app.devtools_panel.as_ref() {
+            win_devtools::close_panel(panel);
+        }
+        app.devtools_open = false;
+        resize_all(
+            &app.window,
+            &app.toolbar,
+            &app.tabs,
+            app.ww,
+            app.wh,
+            false,
+            app.devtools_panel.as_ref(),
+        );
         *slot = None;
     }
 }
@@ -2279,10 +2409,12 @@ fn enqueue_ipc(msg: String) {
     dispatch_win_ipc(&msg);
 }
 
-#[cfg(target_os = "windows")]
 fn content_load_url(webview: &WebView, url: &str) {
-    let load_url = logical_tab_url(url);
-    let _ = webview.load_url(&load_url);
+    if is_internal_newtab_url(url) || url == NEWTAB_URL {
+        let _ = webview.load_url(newtab_data_url());
+    } else {
+        let _ = webview.load_url(url);
+    }
 }
 
 struct IpcContext<'a> {
@@ -2388,10 +2520,7 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
                     ctx.tabs[*ctx.current].url = url.clone();
                     ctx.tabs[*ctx.current].title.clear();
                     ctx.tabs[*ctx.current].loading = true;
-                    #[cfg(target_os = "windows")]
                     content_load_url(&ctx.tabs[*ctx.current].webview, &url);
-                    #[cfg(not(target_os = "windows"))]
-                    let _ = ctx.tabs[*ctx.current].webview.load_url(&url);
                     #[cfg(not(target_os = "windows"))]
                     let _ = ctx.tabs[*ctx.current].webview.focus();
                     sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
@@ -2629,7 +2758,16 @@ fn dispatch_app_event(
                 return;
             }
             if let Some(idx) = find_tab_idx(tabs, tab_id) {
-                tabs[idx].url = logical_tab_url(&url);
+                let logical = logical_tab_url(&url);
+                let was_external = !is_internal_newtab_url(&tabs[idx].url);
+                // Ignore transient internal URLs while an external page is loading.
+                if tabs[idx].loading && was_external && is_internal_newtab_url(&logical) {
+                    return;
+                }
+                if tabs[idx].url == logical {
+                    return;
+                }
+                tabs[idx].url = logical;
                 if idx == *current {
                     sync_toolbar(toolbar, tabs, *current);
                     focus_active_tab(tabs, *current);
@@ -2663,10 +2801,7 @@ fn dispatch_app_event(
                 tabs[idx].url = url.clone();
                 tabs[idx].title.clear();
                 tabs[idx].loading = true;
-                #[cfg(target_os = "windows")]
                 content_load_url(&tabs[idx].webview, &url);
-                #[cfg(not(target_os = "windows"))]
-                let _ = tabs[idx].webview.load_url(&url);
                 if idx == *current {
                     sync_toolbar(toolbar, tabs, *current);
                 }
@@ -2906,9 +3041,15 @@ fn run_windows_app(
 #[cfg(target_os = "windows")]
 fn ensure_webview2_debug_port() {
     const VAR: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
-    if std::env::var(VAR).is_err() {
-        // Needed for docked DevTools (CDP). run-as-app.cmd sets this too.
-        std::env::set_var(VAR, "--remote-debugging-port=9222");
+    const FLAG: &str = "--remote-debugging-port=9222";
+    match std::env::var(VAR) {
+        Ok(existing) if existing.contains("remote-debugging-port") => {}
+        Ok(existing) => {
+            std::env::set_var(VAR, format!("{existing} {FLAG}"));
+        }
+        Err(_) => {
+            std::env::set_var(VAR, FLAG);
+        }
     }
 }
 
@@ -3078,8 +3219,8 @@ mod win_devtools {
 
     fn fetch_targets() -> Option<Vec<Value>> {
         let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_millis(120))
-            .timeout_read(Duration::from_millis(120))
+            .timeout_connect(Duration::from_millis(400))
+            .timeout_read(Duration::from_millis(400))
             .build();
         for endpoint in ["/json/list", "/json"] {
             if let Ok(resp) = agent.get(&format!("{CDP_BASE}{endpoint}")).call() {
