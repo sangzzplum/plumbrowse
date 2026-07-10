@@ -533,6 +533,8 @@ struct Tab {
     url: String,
     title: String,
     loading: bool,
+    #[cfg(target_os = "windows")]
+    cdp_ws: Option<String>,
     webview: WebView,
 }
 
@@ -851,9 +853,21 @@ fn bounds_devtools_panel(win_w: f64, win_h: f64) -> Rect {
     }
 }
 
+fn display_tab_title(title: &str) -> String {
+    let trimmed = title.trim();
+    if let Some(rest) = trimmed.strip_prefix("PlumTab:") {
+        let rest = rest.trim_start();
+        if let Some(pos) = rest.find(' ') {
+            return rest[pos + 1..].trim().to_string();
+        }
+        return String::new();
+    }
+    trimmed.to_string()
+}
+
 fn tab_label(tab: &Tab) -> String {
     if !tab.title.is_empty() {
-        return tab.title.clone();
+        return display_tab_title(&tab.title);
     }
     if tab.url.starts_with("plum://") || tab.url.starts_with("data:text/html") {
         return "Новая вкладка".to_string();
@@ -1249,6 +1263,7 @@ const TOOLBAR_SCRIPT: &str = r#"
     const TAB_MIN = 32;
     const TAB_MAX = 220;
     const TAB_GAP = 8;
+    const SCROLL_TAB_GAP = 4;
 
     function layoutTabs() {
       const strip = document.getElementById('tab-strip');
@@ -1259,19 +1274,21 @@ const TOOLBAR_SCRIPT: &str = r#"
         if (n === 0) return;
 
         const avail = strip.clientWidth;
-        // WebView2 often reports 0 until the first real layout pass.
         if (avail < 8) {
           requestAnimationFrame(() => layoutTabs());
           return;
         }
 
+        const tabsBar = strip.closest('.tabs-bar');
         strip.classList.remove('scroll');
         strip.style.gap = TAB_GAP + 'px';
+        if (tabsBar) tabsBar.classList.remove('scroll-mode');
 
         const minTotal = n * TAB_MIN + Math.max(0, n - 1) * TAB_GAP;
         if (minTotal > avail) {
           strip.classList.add('scroll');
-          strip.style.gap = '0px';
+          strip.style.gap = SCROLL_TAB_GAP + 'px';
+          if (tabsBar) tabsBar.classList.add('scroll-mode');
           tabs.forEach(t => {
             t.style.flex = '0 0 32px';
             t.style.width = '32px';
@@ -1398,7 +1415,7 @@ const TAB_BAR_CSS: &str = r#"
       overflow-x:auto; overflow-y:hidden;
       scrollbar-width:thin; scrollbar-color:#5f6368 transparent;
     }
-    .tab-strip.scroll { gap:0 !important; }
+    .tab-strip.scroll { gap:4px !important; }
     .tab-strip::-webkit-scrollbar { height:var(--scroll-size, 3px); transition:height 0.15s ease; }
     .tab-strip:hover::-webkit-scrollbar { height:var(--scroll-size-hover, 8px); }
     .tab-strip::-webkit-scrollbar-thumb { background:#5f6368; border-radius:4px; min-height:var(--scroll-size-hover, 8px); }
@@ -1439,14 +1456,15 @@ const TAB_BAR_CSS: &str = r#"
     .tab-strip.scroll .tab-title { display:none !important; }
     .tab-strip.scroll .tab {
       padding:0 !important; width:32px !important; min-width:32px !important; max-width:32px !important;
-      height:32px !important; border-radius:6px; display:flex; align-items:center; justify-content:center;
+      height:32px !important; border-radius:12px; display:flex; align-items:center; justify-content:center;
       flex:0 0 32px !important; border:none; margin:0 !important; gap:0 !important;
       overflow:hidden;
     }
     .tab-strip.scroll .tab-icon { width:16px !important; height:16px !important; margin:0 !important; flex:0 0 16px !important; }
     .tab-strip.scroll .tab-close {
-      position:absolute; inset:0; width:32px !important; height:32px !important; margin:auto;
-      border-radius:6px; right:auto; top:auto;
+      position:absolute; left:0; right:0; top:50%; transform:translateY(-50%);
+      width:32px !important; height:32px !important; margin:0 auto;
+      border-radius:12px;
     }
     .tab-strip.scroll .tab:hover .tab-icon { opacity:0; }
     .tab-strip.scroll .tab:hover .tab-close,
@@ -1495,6 +1513,21 @@ const WINDOWS_TAB_BAR_CSS: &str = r#"
       width:100%;
       box-sizing:border-box;
     }
+    .tabs-bar.scroll-mode {
+      display:flex !important;
+      align-items:flex-start;
+    }
+    .tabs-bar.scroll-mode .tab-strip {
+      flex:0 1 auto;
+      min-width:0;
+      max-width:calc(100% - 40px);
+      width:auto;
+    }
+    .tabs-bar.scroll-mode #addtab-inline,
+    .tabs-bar.scroll-mode #addtab-fixed {
+      flex:0 0 32px;
+      margin-left:0;
+    }
     .tab-strip {
       grid-column:1;
       min-width:0;
@@ -1503,6 +1536,22 @@ const WINDOWS_TAB_BAR_CSS: &str = r#"
     #addtab-inline { grid-column:2; align-self:start; width:32px; height:32px; }
     #addtab-fixed { grid-column:2; align-self:start; width:32px; height:32px; }
     .toolbar { position:relative; }
+"#;
+
+const MAC_TAB_STRIP_CSS: &str = r#"
+    .tabs-bar.scroll-mode {
+      display:flex !important;
+      align-items:flex-start;
+    }
+    .tabs-bar.scroll-mode .tab-strip {
+      flex:0 1 auto;
+      min-width:0;
+      max-width:calc(100% - 40px);
+      width:auto;
+    }
+    .tabs-bar.scroll-mode .addtab {
+      flex:0 0 32px;
+    }
 "#;
 
 const WINDOWS_TAB_LAYOUT_SCRIPT: &str = r#"
@@ -1736,7 +1785,7 @@ fn toolbar_html() -> String {
 </body>
 </html>"#,
             script = TOOLBAR_SCRIPT,
-            tab_bar_css = format!("{TAB_BAR_CSS}\n{MAC_TAB_BAR_CSS}"),
+            tab_bar_css = format!("{TAB_BAR_CSS}\n{MAC_TAB_BAR_CSS}\n{MAC_TAB_STRIP_CSS}"),
             omnibox_placeholder = OMNIBOX_PLACEHOLDER,
             browser_icon = json!(browser_icon_data_url()),
         );
@@ -1828,6 +1877,9 @@ fn toolbar_html() -> String {
     )
 }
 
+#[cfg(target_os = "windows")]
+const WINDOWS_CDP_BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port=9222 --remote-allow-origins=*";
+
 fn build_content_webview(
     window: &Window,
     proxy: EventLoopProxy<UserEvent>,
@@ -1837,12 +1889,10 @@ fn build_content_webview(
     wh: f64,
     visible: bool,
     devtools_open: bool,
+    #[cfg(target_os = "windows")] webview_env_from: Option<&WebView>,
 ) -> WebView {
     #[cfg(target_os = "windows")]
-    let content_init = format!(
-        "{CONTENT_SHORTCUT_SCRIPT}\n{WIN_CONTENT_CONTEXT_SCRIPT}\n{}",
-        content_tab_marker_script(tab_id)
-    );
+    let content_init = format!("{CONTENT_SHORTCUT_SCRIPT}\n{WIN_CONTENT_CONTEXT_SCRIPT}");
     #[cfg(target_os = "macos")]
     let content_init = format!("{CONTENT_SHORTCUT_SCRIPT}\n{MAC_EDIT_SCRIPT}");
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -1927,6 +1977,14 @@ fn build_content_webview(
 
     #[cfg(target_os = "windows")]
     let builder = builder.with_browser_accelerator_keys(false);
+
+    #[cfg(target_os = "windows")]
+    let builder = if let Some(source) = webview_env_from {
+        use wry::{WebViewBuilderExtWindows, WebViewExtWindows};
+        builder.with_environment(source.environment())
+    } else {
+        builder
+    };
 
     let is_newtab = url == NEWTAB_URL || is_internal_newtab_url(url);
     let webview = if is_newtab {
@@ -2150,6 +2208,9 @@ fn macos_edit_from_key(key: KeyCode, super_key: bool) -> Option<MacEditCommand> 
 }
 
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
+    #[cfg(target_os = "windows")]
+    use wry::WebViewBuilderExtWindows;
+
     let proxy_ready = proxy.clone();
     let proxy_ipc = proxy.clone();
     #[cfg(not(target_os = "windows"))]
@@ -2196,7 +2257,8 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
     #[cfg(target_os = "windows")]
     let builder = builder
         .with_html(&toolbar_html())
-        .with_custom_protocol("plum".to_string(), plum_protocol);
+        .with_custom_protocol("plum".to_string(), plum_protocol)
+        .with_additional_browser_args(WINDOWS_CDP_BROWSER_ARGS);
 
     #[cfg(not(target_os = "windows"))]
     let builder = builder.with_html(&toolbar_html());
@@ -2216,30 +2278,6 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
     }
 
     toolbar
-}
-
-#[cfg(target_os = "windows")]
-fn content_tab_marker_script(tab_id: u32) -> String {
-    format!(
-        r#"(function(id){{
-  function mark(){{
-    var m='PlumTab:'+id;
-    var t=document.title||'';
-    if(t.indexOf(m)===0)return;
-    var base=t.replace(/^PlumTab:\d+\s*/,'').trim();
-    document.title=base?m+' '+base:m;
-  }}
-  mark();
-  document.addEventListener('DOMContentLoaded',mark);
-  document.addEventListener('readystatechange',mark);
-}})({tab_id});"#,
-        tab_id = tab_id
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn stamp_cdp_tab_title(webview: &WebView, tab_id: u32) {
-    let _ = webview.evaluate_script(&content_tab_marker_script(tab_id));
 }
 
 #[cfg(target_os = "windows")]
@@ -2266,7 +2304,14 @@ fn devtools_error_data_url(message: &str) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn build_devtools_panel(window: &Window, ww: f64, wh: f64) -> WebView {
+fn build_devtools_panel(
+    window: &Window,
+    ww: f64,
+    wh: f64,
+    webview_env_from: &WebView,
+) -> WebView {
+    use wry::{WebViewBuilderExtWindows, WebViewExtWindows};
+
     WebViewBuilder::new()
         .with_html(DEVTOOLS_PANEL_HTML)
         .with_bounds(bounds_devtools_panel(ww, wh))
@@ -2274,6 +2319,7 @@ fn build_devtools_panel(window: &Window, ww: f64, wh: f64) -> WebView {
         .with_visible(false)
         .with_devtools(false)
         .with_hotkeys_zoom(false)
+        .with_environment(webview_env_from.environment())
         .with_navigation_handler(|url| {
             url.starts_with("http://127.0.0.1:9222")
                 || url.starts_with("about:")
@@ -2321,12 +2367,16 @@ fn open_new_tab(
         wh,
         false,
         devtools_open,
+        #[cfg(target_os = "windows")]
+        Some(toolbar),
     );
     tabs.push(Tab {
         id: tab_id,
         url: logical_tab_url(url),
         title,
         loading: false,
+        #[cfg(target_os = "windows")]
+        cdp_ws: None,
         webview,
     });
     *current = tabs.len() - 1;
@@ -2422,7 +2472,6 @@ fn devtools_connect_slot() -> &'static Mutex<Option<DevtoolsConnectState>> {
 #[cfg(target_os = "windows")]
 fn sync_windows_devtools(panel: &WebView, tab: &Tab, open: bool) {
     if open {
-        stamp_cdp_tab_title(&tab.webview, tab.id);
         let page_url = logical_tab_url(&tab.url);
         *devtools_connect_slot()
             .lock()
@@ -2476,11 +2525,28 @@ fn tick_devtools_connect(app: &mut WindowsRunState) {
     let Some((tab_id, page_url, attempts)) = poll else {
         return;
     };
+    let cached_ws = app
+        .tabs
+        .iter()
+        .find(|t| t.id == tab_id)
+        .and_then(|t| t.cdp_ws.clone());
+    let cached_ws = if cached_ws.is_none() {
+        if let Some(ws) = win_devtools::discover_ws_for_page(&page_url) {
+            if let Some(idx) = app.tabs.iter().position(|t| t.id == tab_id) {
+                app.tabs[idx].cdp_ws = Some(ws.clone());
+            }
+            Some(ws)
+        } else {
+            None
+        }
+    } else {
+        cached_ws
+    };
     let Some(panel) = app.devtools_panel.as_ref() else {
         return;
     };
 
-    if let Some(url) = win_devtools::inspector_url_for_tab(tab_id, &page_url) {
+    if let Some(url) = win_devtools::inspector_url_for_page(&page_url, cached_ws.as_deref()) {
         log_windows_debug(&format!("devtools: inspector ready for tab {tab_id}"));
         let _ = panel.load_url(&url);
         let _ = panel.set_visible(true);
@@ -2521,7 +2587,12 @@ fn tick_devtools_panel_build(app: &mut WindowsRunState) {
 
     win_startup("lazy: devtools panel");
     log_windows_debug("devtools: creating docked panel webview");
-    app.devtools_panel = Some(build_devtools_panel(&app.window, app.ww, app.wh));
+    app.devtools_panel = Some(build_devtools_panel(
+        &app.window,
+        app.ww,
+        app.wh,
+        &app.toolbar,
+    ));
     resize_all(
         &app.window,
         &app.toolbar,
@@ -3245,7 +3316,15 @@ fn dispatch_app_event(
             if let Some(idx) = find_tab_idx(tabs, tab_id) {
                 tabs[idx].loading = false;
                 #[cfg(target_os = "windows")]
-                stamp_cdp_tab_title(&tabs[idx].webview, tab_id);
+                {
+                    let page_url = logical_tab_url(&tabs[idx].url);
+                    if let Some(ws) = win_devtools::discover_ws_for_page(&page_url) {
+                        tabs[idx].cdp_ws = Some(ws);
+                    }
+                    let _ = tabs[idx].webview.evaluate_script(
+                        "if(document.title){document.title=document.title.replace(/^PlumTab:\\d+\\s*/,'');}",
+                    );
+                }
                 if idx == *current {
                     sync_toolbar(toolbar, tabs, *current);
                 }
@@ -3267,12 +3346,9 @@ fn dispatch_app_event(
 
         Event::UserEvent(UserEvent::TitleChanged { tab_id, title }) => {
             if let Some(idx) = find_tab_idx(tabs, tab_id) {
-                tabs[idx].title = title;
+                tabs[idx].title = display_tab_title(&title);
                 #[cfg(target_os = "windows")]
-                {
-                    stamp_cdp_tab_title(&tabs[idx].webview, tab_id);
-                    sync_toolbar(toolbar, tabs, *current);
-                }
+                sync_toolbar(toolbar, tabs, *current);
                 #[cfg(not(target_os = "windows"))]
                 {
                     let titles = tabs.iter().map(tab_label).collect::<Vec<_>>();
@@ -3416,12 +3492,14 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
                 app.wh,
                 false,
                 app.devtools_open,
+                Some(&app.toolbar),
             );
             app.tabs.push(Tab {
                 id: 1,
                 url: NEWTAB_URL.to_string(),
                 title: "Новая вкладка".to_string(),
                 loading: false,
+                cdp_ws: None,
                 webview,
             });
             let _ = app.tabs[0].webview.set_visible(true);
@@ -3433,7 +3511,17 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
         2 => {
             win_startup("bootstrap: devtools panel");
             if app.devtools_panel.is_none() {
-                app.devtools_panel = Some(build_devtools_panel(&app.window, app.ww, app.wh));
+                app.devtools_panel = Some(build_devtools_panel(
+                    &app.window,
+                    app.ww,
+                    app.wh,
+                    &app.toolbar,
+                ));
+            }
+            if let Some(count) = win_devtools::probe_target_count() {
+                log_windows_debug(&format!("cdp: {count} targets on port 9222"));
+            } else {
+                log_windows_debug("cdp: port 9222 not responding");
             }
             focus_main_window(&app.window);
             raise_toolbar(
@@ -3679,47 +3767,60 @@ mod win_devtools {
         let _ = panel.load_url("about:blank");
     }
 
-    pub fn inspector_url_for_tab(tab_id: u32, page_url: &str) -> Option<String> {
+    pub fn probe_target_count() -> Option<usize> {
+        fetch_targets().map(|targets| targets.len())
+    }
+
+    pub fn discover_ws_for_page(page_url: &str) -> Option<String> {
         let targets = fetch_targets()?;
-        pick_target_for_tab(&targets, tab_id, page_url).and_then(|target| {
+        pick_content_target(&targets, page_url).and_then(ws_from_target)
+    }
+
+    pub fn inspector_url_for_page(page_url: &str, cached_ws: Option<&str>) -> Option<String> {
+        if let Some(ws) = cached_ws {
+            return Some(inspector_url_from_ws(ws));
+        }
+        let targets = fetch_targets()?;
+        pick_content_target(&targets, page_url).and_then(|target| {
             if let Some(path) = target.get("devtoolsFrontendUrl").and_then(|v| v.as_str()) {
                 return Some(frontend_url(path));
             }
-            let ws = target.get("webSocketDebuggerUrl")?.as_str()?;
-            Some(format!(
-                "{CDP_BASE}/devtools/inspector.html?ws={}",
-                ws.trim_start_matches("ws://")
-            ))
+            ws_from_target(target).map(|ws| inspector_url_from_ws(&ws))
         })
+    }
+
+    fn inspector_url_from_ws(ws: &str) -> String {
+        format!(
+            "{CDP_BASE}/devtools/inspector.html?ws={}",
+            ws.trim_start_matches("ws://")
+        )
+    }
+
+    fn ws_from_target(target: &Value) -> Option<String> {
+        target
+            .get("webSocketDebuggerUrl")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
     }
 
     fn is_devtools_chrome_target(url: &str) -> bool {
         url.contains("inspector.html") || url.contains("/devtools/bundled/")
     }
 
-    fn pick_target_for_tab<'a>(
-        targets: &'a [Value],
-        tab_id: u32,
-        page_url: &str,
-    ) -> Option<&'a Value> {
-        let marker = format!("PlumTab:{tab_id}");
+    fn is_toolbar_target(url: &str) -> bool {
+        url.starts_with("data:text/html") && url.contains("PlumBrowser")
+    }
+
+    fn pick_content_target<'a>(targets: &'a [Value], page_url: &str) -> Option<&'a Value> {
         let pages: Vec<&Value> = targets
             .iter()
             .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
             .filter(|t| {
                 t.get("url")
                     .and_then(|v| v.as_str())
-                    .is_some_and(|url| !is_devtools_chrome_target(url))
+                    .is_some_and(|url| !is_devtools_chrome_target(url) && !is_toolbar_target(url))
             })
             .collect();
-
-        if let Some(hit) = pages.iter().copied().find(|t| {
-            t.get("title")
-                .and_then(|v| v.as_str())
-                .is_some_and(|title| title.starts_with(&marker))
-        }) {
-            return Some(hit);
-        }
 
         pages
             .iter()
