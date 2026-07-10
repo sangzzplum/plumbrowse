@@ -1262,12 +1262,13 @@ const TOOLBAR_SCRIPT: &str = r#"
           return;
         }
 
-        const gap = TAB_GAP;
         strip.classList.remove('scroll');
+        strip.style.gap = TAB_GAP + 'px';
 
-        const minTotalScroll = n * TAB_MIN;
-        if (minTotalScroll > avail) {
+        const minTotal = n * TAB_MIN + Math.max(0, n - 1) * TAB_GAP;
+        if (minTotal > avail) {
           strip.classList.add('scroll');
+          strip.style.gap = '0px';
           tabs.forEach(t => {
             t.style.flex = '0 0 32px';
             t.style.width = '32px';
@@ -1275,6 +1276,8 @@ const TOOLBAR_SCRIPT: &str = r#"
             t.style.maxWidth = '32px';
             t.style.height = '32px';
             t.style.margin = '0';
+            t.style.padding = '0';
+            t.style.boxSizing = 'border-box';
           });
           const active = strip.querySelector('.tab.active');
           if (active) active.scrollIntoView({ inline: 'nearest', block: 'nearest' });
@@ -1285,7 +1288,7 @@ const TOOLBAR_SCRIPT: &str = r#"
           return;
         }
 
-        let width = Math.floor((avail - Math.max(0, n - 1) * gap) / n);
+        let width = Math.floor((avail - Math.max(0, n - 1) * TAB_GAP) / n);
         width = Math.min(TAB_MAX, Math.max(TAB_MIN, width));
         tabs.forEach(t => {
           t.style.flex = '1 1 0';
@@ -1383,18 +1386,19 @@ const TAB_BAR_CSS: &str = r#"
     .tab-strip {
       display:flex; gap:8px; align-items:flex-start;
       flex:1 1 auto; min-width:48px;
-      height:36px;
+      height:32px;
+      box-sizing:content-box;
+      padding-bottom:var(--scroll-gutter, 4px);
       overflow-x:auto; overflow-y:hidden;
       scrollbar-width:thin; scrollbar-color:#5f6368 transparent;
-      box-sizing:border-box;
     }
     .tab-strip.scroll { gap:0 !important; }
-    .tab-strip::-webkit-scrollbar { height:2px; }
-    .tab-strip:hover::-webkit-scrollbar { height:4px; }
-    .tab-strip::-webkit-scrollbar-thumb { background:#5f6368; border-radius:4px; }
-    .tab-strip::-webkit-scrollbar-track { background:transparent; margin-top:2px; }
+    .tab-strip::-webkit-scrollbar { height:var(--scroll-size, 3px); transition:height 0.15s ease; }
+    .tab-strip:hover::-webkit-scrollbar { height:var(--scroll-size-hover, 8px); }
+    .tab-strip::-webkit-scrollbar-thumb { background:#5f6368; border-radius:4px; min-height:var(--scroll-size-hover, 8px); }
+    .tab-strip::-webkit-scrollbar-track { background:transparent; }
     .addtab {
-      width:36px; height:32px; border-radius:12px; background:var(--b);
+      width:32px; height:32px; border-radius:12px; background:var(--b);
       display:grid; place-items:center; cursor:pointer; user-select:none;
       flex:0 0 auto; font-size:18px; line-height:1;
     }
@@ -1421,16 +1425,17 @@ const TAB_BAR_CSS: &str = r#"
     }
     .tab:hover .tab-close, .tab.active .tab-close { opacity:1; pointer-events:auto; }
     .tab-close:hover { background:#2a2b2f; color:var(--fg); }
-    .tab-strip.scroll .tab-title { display:none; }
+    .tab-strip.scroll .tab-title { display:none !important; }
     .tab-strip.scroll .tab {
       padding:0 !important; width:32px !important; min-width:32px !important; max-width:32px !important;
-      height:32px !important; border-radius:8px; display:flex; align-items:center; justify-content:center;
-      flex:0 0 32px !important; border:none; margin:0; gap:0;
+      height:32px !important; border-radius:6px; display:flex; align-items:center; justify-content:center;
+      flex:0 0 32px !important; border:none; margin:0 !important; gap:0 !important;
+      overflow:hidden;
     }
-    .tab-strip.scroll .tab-icon { width:16px; height:16px; margin:0; }
+    .tab-strip.scroll .tab-icon { width:16px !important; height:16px !important; margin:0 !important; flex:0 0 16px !important; }
     .tab-strip.scroll .tab-close {
-      position:absolute; inset:0; width:32px; height:32px; margin:auto;
-      border-radius:8px; right:auto; top:auto;
+      position:absolute; inset:0; width:32px !important; height:32px !important; margin:auto;
+      border-radius:6px; right:auto; top:auto;
     }
     .tab-strip.scroll .tab:hover .tab-icon { opacity:0; }
     .tab-strip.scroll .tab:hover .tab-close,
@@ -1448,6 +1453,22 @@ const TAB_BAR_CSS: &str = r#"
     }
     .url-clear.visible { display:grid; }
     .url-clear:hover { background:#2a2b2f; color:var(--fg); }
+"#;
+
+const MAC_TAB_BAR_CSS: &str = r#"
+    body.platform-mac .tab-strip {
+      --scroll-gutter: 6px;
+      --scroll-size: 4px;
+      --scroll-size-hover: 10px;
+    }
+"#;
+
+const WIN_TAB_SCROLL_CSS: &str = r#"
+    body.platform-win .tab-strip {
+      --scroll-gutter: 8px;
+      --scroll-size: 1px;
+      --scroll-size-hover: 5px;
+    }
 "#;
 
 const WINDOWS_TAB_BAR_CSS: &str = r#"
@@ -1468,8 +1489,8 @@ const WINDOWS_TAB_BAR_CSS: &str = r#"
       min-width:0;
       width:100%;
     }
-    #addtab-inline { grid-column:2; align-self:start; }
-    #addtab-fixed { grid-column:2; align-self:start; }
+    #addtab-inline { grid-column:2; align-self:start; width:32px; height:32px; }
+    #addtab-fixed { grid-column:2; align-self:start; width:32px; height:32px; }
     .toolbar { position:relative; }
 "#;
 
@@ -1641,7 +1662,7 @@ fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
   <script>{tab_layout_script}</script>
 </body>
 </html>"#,
-        tab_bar_css = format!("{TAB_BAR_CSS}\n{WINDOWS_TAB_BAR_CSS}"),
+        tab_bar_css = format!("{TAB_BAR_CSS}\n{WINDOWS_TAB_BAR_CSS}\n{WIN_TAB_SCROLL_CSS}"),
         omnibox_placeholder = OMNIBOX_PLACEHOLDER,
         tab_layout_script = WINDOWS_TAB_LAYOUT_SCRIPT,
     )
@@ -1679,7 +1700,7 @@ fn toolbar_html() -> String {
     .navbtn:hover {{ background:var(--b2); }}
   </style>
 </head>
-<body>
+<body class="platform-mac">
   <div class="chrome">
     <div class="tabs-wrap">
       <div class="tabs-bar">
@@ -1704,7 +1725,7 @@ fn toolbar_html() -> String {
 </body>
 </html>"#,
             script = TOOLBAR_SCRIPT,
-            tab_bar_css = TAB_BAR_CSS,
+            tab_bar_css = format!("{TAB_BAR_CSS}\n{MAC_TAB_BAR_CSS}"),
             omnibox_placeholder = OMNIBOX_PLACEHOLDER,
             browser_icon = json!(browser_icon_data_url()),
         );
@@ -1756,7 +1777,7 @@ fn toolbar_html() -> String {
     .go:hover {{ background:var(--b2); }}
   </style>
 </head>
-<body>
+<body class="platform-win">
   <div class="chrome">
     <div class="titlebar">
       <div class="drag" id="drag">{version}</div>
@@ -1789,7 +1810,7 @@ fn toolbar_html() -> String {
 </body>
 </html>"#,
         script = TOOLBAR_SCRIPT,
-        tab_bar_css = format!("{TAB_BAR_CSS}\n{WINDOWS_TAB_BAR_CSS}"),
+        tab_bar_css = format!("{TAB_BAR_CSS}\n{WINDOWS_TAB_BAR_CSS}\n{WIN_TAB_SCROLL_CSS}"),
         version = version_label(),
         omnibox_placeholder = OMNIBOX_PLACEHOLDER,
         browser_icon = json!(browser_icon_data_url()),
@@ -2297,7 +2318,7 @@ struct WindowsRunState {
     modifiers: ModifiersState,
     z_order_nudges: u32,
     proxy: EventLoopProxy<UserEvent>,
-    /// 0 = show window, 1 = ipc ready, 2 = bootstrap complete
+    /// 0 = show window, 1 = content webview, 2 = devtools panel, 3 = bootstrap complete
     bootstrap_phase: u8,
     startup_focus_frames: u32,
 }
@@ -2309,7 +2330,31 @@ struct DevtoolsConnectState {
 }
 
 #[cfg(target_os = "windows")]
-const DEVTOOLS_CONNECT_MAX: u32 = 150;
+const DEVTOOLS_CONNECT_MAX: u32 = 80;
+
+#[cfg(target_os = "windows")]
+const DEVTOOLS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[cfg(target_os = "windows")]
+fn devtools_last_poll() -> &'static Mutex<Option<Instant>> {
+    static SLOT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(target_os = "windows")]
+fn devtools_poll_due() -> bool {
+    let mut slot = devtools_last_poll()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if let Some(last) = *slot {
+        if now.duration_since(last) < DEVTOOLS_POLL_INTERVAL {
+            return false;
+        }
+    }
+    *slot = Some(now);
+    true
+}
 
 #[cfg(target_os = "windows")]
 fn devtools_connect_slot() -> &'static Mutex<Option<DevtoolsConnectState>> {
@@ -2333,6 +2378,9 @@ fn sync_windows_devtools(panel: &WebView, tab: &Tab, open: bool) {
         *devtools_connect_slot()
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        *devtools_last_poll()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         win_devtools::close_panel(panel);
         log_windows_debug("devtools: docked panel closed");
     }
@@ -2340,22 +2388,36 @@ fn sync_windows_devtools(panel: &WebView, tab: &Tab, open: bool) {
 
 #[cfg(target_os = "windows")]
 fn tick_devtools_connect(app: &mut WindowsRunState) {
-    let mut slot = devtools_connect_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let Some(state) = slot.as_mut() else {
+    let poll = {
+        let mut slot = devtools_connect_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(state) = slot.as_mut() else {
+            return;
+        };
+        if !app.devtools_open {
+            *slot = None;
+            return;
+        }
+        if app.devtools_panel.is_none() {
+            *slot = None;
+            return;
+        }
+        if !devtools_poll_due() {
+            return;
+        }
+        state.attempts += 1;
+        Some((state.page_url.clone(), state.attempts))
+    };
+
+    let Some((page_url, attempts)) = poll else {
         return;
     };
-    if !app.devtools_open {
-        *slot = None;
-        return;
-    }
     let Some(panel) = app.devtools_panel.as_ref() else {
-        *slot = None;
         return;
     };
 
-    if let Some(url) = win_devtools::inspector_url_for_page(&state.page_url) {
+    if let Some(url) = win_devtools::inspector_url_for_page(&page_url) {
         log_windows_debug("devtools: inspector ready");
         let _ = panel.load_url(&url);
         let _ = panel.set_visible(true);
@@ -2365,12 +2427,13 @@ fn tick_devtools_connect(app: &mut WindowsRunState) {
             Some(&app.tabs),
             app.devtools_panel.as_ref(),
         );
-        *slot = None;
+        *devtools_connect_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         return;
     }
 
-    state.attempts += 1;
-    if state.attempts >= DEVTOOLS_CONNECT_MAX {
+    if attempts >= DEVTOOLS_CONNECT_MAX {
         log_windows_debug("devtools: CDP connect timed out, opening DevTools window");
         if let Some(tab) = app.tabs.get(app.current) {
             tab.webview.open_devtools();
@@ -2388,7 +2451,9 @@ fn tick_devtools_connect(app: &mut WindowsRunState) {
             false,
             app.devtools_panel.as_ref(),
         );
-        *slot = None;
+        *devtools_connect_slot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -3275,7 +3340,7 @@ fn build_window(event_loop: &tao::event_loop::EventLoop<UserEvent>) -> Window {
 #[cfg(target_os = "windows")]
 fn bootstrap_win_app(app: &mut WindowsRunState) {
     match app.bootstrap_phase {
-        2 => return,
+        3 => return,
         0 => {
             win_startup("bootstrap: show window");
             app.window.set_visible(true);
@@ -3308,7 +3373,14 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
             let _ = app.tabs[0].webview.set_visible(true);
             app.current = 0;
             app.next_id = 2;
-
+            app.bootstrap_phase = 2;
+            log_windows_debug("bootstrap: content webview ready (phase 1)");
+        }
+        2 => {
+            win_startup("bootstrap: devtools panel");
+            if app.devtools_panel.is_none() {
+                app.devtools_panel = Some(build_devtools_panel(&app.window, app.ww, app.wh));
+            }
             focus_main_window(&app.window);
             raise_toolbar(
                 &app.toolbar,
@@ -3328,7 +3400,7 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
             sync_toolbar(&app.toolbar, &app.tabs, app.current);
             log_windows_layout(&app.toolbar, &app.tabs, "startup");
             flush_toolbar(&app.toolbar);
-            app.bootstrap_phase = 2;
+            app.bootstrap_phase = 3;
             log_windows_debug("bootstrap complete");
         }
         _ => {}
@@ -3576,8 +3648,8 @@ mod win_devtools {
 
     fn fetch_targets() -> Option<Vec<Value>> {
         let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_millis(400))
-            .timeout_read(Duration::from_millis(400))
+            .timeout_connect(Duration::from_millis(80))
+            .timeout_read(Duration::from_millis(80))
             .build();
         for endpoint in ["/json/list", "/json"] {
             if let Ok(resp) = agent.get(&format!("{CDP_BASE}{endpoint}")).call() {
