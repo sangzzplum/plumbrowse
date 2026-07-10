@@ -5,14 +5,13 @@ use serde_json::json;
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
-#[cfg(target_os = "windows")]
-use std::cell::UnsafeCell;
-#[cfg(target_os = "windows")]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex,
 };
+use std::time::{Duration, Instant};
+#[cfg(target_os = "windows")]
+use std::cell::UnsafeCell;
 use tao::{
     dpi::PhysicalSize,
     event::{ElementState, Event, WindowEvent},
@@ -356,17 +355,11 @@ fn webview_go_back(webview: &WebView) {
 }
 
 fn open_docked_devtools(webview: &WebView) {
-    #[cfg(not(target_os = "windows"))]
-    webview.open_devtools();
-    #[cfg(target_os = "windows")]
-    let _ = webview;
+    let _ = webview.open_devtools();
 }
 
 fn close_docked_devtools(webview: &WebView) {
-    #[cfg(not(target_os = "windows"))]
-    webview.close_devtools();
-    #[cfg(target_os = "windows")]
-    let _ = webview;
+    let _ = webview.close_devtools();
 }
 
 fn webview_go_forward(webview: &WebView) {
@@ -427,6 +420,9 @@ const TOOLBAR_LOCK_SCRIPT: &str = r#"
   }, true);
   document.addEventListener('keydown', e => {
     const k = e.key.toLowerCase();
+    if (e.metaKey && (k === 'a' || k === 'c' || k === 'v' || k === 'x')) {
+      return;
+    }
     if (e.key === 'F5' || ((e.metaKey || e.ctrlKey) && k === 'r')) {
       e.preventDefault();
       e.stopPropagation();
@@ -539,12 +535,14 @@ enum UserEvent {
     LoadStarted { tab_id: u32 },
     LoadFinished { tab_id: u32 },
     ForceLoad { tab_id: u32, url: String },
+    OpenTab,
 }
 
 /// Windows toolbar is re-rendered from Rust (WebView2 often won't run toolbar JS / evaluate_script).
 #[cfg(target_os = "windows")]
 #[derive(Clone)]
 struct ToolbarSnapshot {
+    ids: Vec<u32>,
     titles: Vec<String>,
     urls: Vec<String>,
     current: usize,
@@ -556,6 +554,7 @@ struct ToolbarSnapshot {
 impl ToolbarSnapshot {
     fn new_default() -> Self {
         Self {
+            ids: vec![1],
             titles: vec!["Новая вкладка".to_string()],
             urls: vec![NEWTAB_URL.to_string()],
             current: 0,
@@ -853,6 +852,7 @@ fn tab_label(tab: &Tab) -> String {
 /// Keep logical URLs in tab state and the omnibox (never show data: document URLs).
 fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
     let titles: Vec<String> = tabs.iter().map(tab_label).collect();
+    let ids: Vec<u32> = tabs.iter().map(|t| t.id).collect();
 
     #[cfg(target_os = "windows")]
     {
@@ -869,6 +869,7 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
             let mut snap = toolbar_snapshot()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            snap.ids = ids;
             snap.titles = titles;
             snap.urls = urls;
             snap.current = current;
@@ -895,6 +896,7 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
     #[cfg(not(target_os = "windows"))]
     let script = format!(
         r#"(function(){{
+  var ids = {ids};
   var titles = {titles};
   var urls = {urls};
   var cur = {current};
@@ -902,13 +904,13 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
   var loading = {loading};
   function apply() {{
     if (typeof window.__setState === 'function') {{
-      window.__setState(titles, urls, cur, url, loading);
+      window.__setState(ids, titles, urls, cur, url, loading);
       return true;
     }}
     return false;
   }}
   if (!apply()) {{
-    window.__pendingState = [titles, urls, cur, url, loading];
+    window.__pendingState = [ids, titles, urls, cur, url, loading];
     var tries = 0;
     (function retry() {{
       if (apply() || ++tries > 120) return;
@@ -916,6 +918,7 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
     }})();
   }}
 }})();"#,
+        ids = json!(ids),
         titles = json!(titles),
         urls = json!(urls),
         current = current,
@@ -1015,11 +1018,6 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
       color:var(--fg); font:inherit; padding:10px 0;
     }
     .search-box input::placeholder { color:var(--mut); }
-    .search-box button {
-      border:none; border-radius:20px; background:var(--accent); color:#0f1115;
-      font:inherit; font-weight:600; padding:10px 18px; cursor:pointer;
-    }
-    .search-box button:hover { filter:brightness(1.05); }
     .hint { margin-top:18px; color:var(--mut); font-size:14px; text-align:center; }
   </style>
 </head>
@@ -1027,9 +1025,8 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
   <div class="brand">PlumBrowser</div>
   <form class="search-form" id="search-form">
     <div class="search-box">
-      <input id="search" type="search" autocomplete="off" spellcheck="false"
+      <input id="search" type="text" autocomplete="off" spellcheck="false"
         placeholder="Введите адрес или выполните поиск" autofocus />
-      <button type="submit">Перейти</button>
     </div>
   </form>
   <div class="hint">Или используйте строку адреса вверху окна</div>
@@ -1156,12 +1153,29 @@ const TOOLBAR_SCRIPT: &str = r#"
       bindBtn('devtools', () => post('nav_devtools'));
 
       const urlInput = document.getElementById('url');
-      const go = document.getElementById('go');
-      if (go && urlInput) {
-        go.addEventListener('click', () => post('load:' + urlInput.value));
+      const urlClear = document.getElementById('url-clear');
+      function syncUrlClear() {
+        if (!urlInput || !urlClear) return;
+        urlClear.classList.toggle('visible', !!urlInput.value);
+      }
+      if (urlClear) {
+        urlClear.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (urlInput) {
+            urlInput.value = '';
+            syncUrlClear();
+            urlInput.focus();
+            post('focus_toolbar');
+          }
+        });
+      }
+      if (urlInput) {
         urlInput.addEventListener('keydown', (e) => {
           if (e.key === 'Enter') post('load:' + e.target.value);
         });
+        urlInput.addEventListener('input', syncUrlClear);
+        urlInput.addEventListener('focus', () => post('focus_toolbar'));
         urlInput.addEventListener('blur', () => post('focus_content'));
       }
     }
@@ -1170,7 +1184,7 @@ const TOOLBAR_SCRIPT: &str = r#"
       initToolbar();
       if (window.__pendingState && typeof window.__setState === 'function') {
         const pending = window.__pendingState;
-        window.__setState(pending[0], pending[1], pending[2], pending[3], pending[4] || false);
+        window.__setState(pending[0], pending[1], pending[2], pending[3], pending[4], pending[5] || false);
         delete window.__pendingState;
       }
     }
@@ -1201,10 +1215,11 @@ const TOOLBAR_SCRIPT: &str = r#"
         if (minTotal > avail) {
           strip.classList.add('scroll');
           tabs.forEach(t => {
-            t.style.flex = '0 0 ' + TAB_MIN + 'px';
-            t.style.width = TAB_MIN + 'px';
-            t.style.minWidth = TAB_MIN + 'px';
-            t.style.maxWidth = TAB_MIN + 'px';
+            t.style.flex = '0 0 32px';
+            t.style.width = '32px';
+            t.style.minWidth = '32px';
+            t.style.maxWidth = '32px';
+            t.style.height = '32px';
           });
           const active = strip.querySelector('.tab.active');
           if (active) active.scrollIntoView({ inline: 'nearest', block: 'nearest' });
@@ -1222,6 +1237,7 @@ const TOOLBAR_SCRIPT: &str = r#"
           t.style.width = width + 'px';
           t.style.minWidth = TAB_MIN + 'px';
           t.style.maxWidth = TAB_MAX + 'px';
+          t.style.height = '32px';
         });
 
         const addInline = document.getElementById('addtab-inline');
@@ -1233,15 +1249,16 @@ const TOOLBAR_SCRIPT: &str = r#"
 
     window.addEventListener('resize', () => layoutTabs());
 
-    window.__setState = function(tabTitles, tabUrls, current, url, loading) {
+    window.__setState = function(tabIds, tabTitles, tabUrls, current, url, loading) {
       const strip = document.getElementById('tab-strip');
       if (!strip) return;
       strip.innerHTML = '';
 
       tabTitles.forEach((title, i) => {
+        const tabId = tabIds[i];
         const t = document.createElement('div');
         t.className = 'tab' + (i === current ? ' active' : '');
-        t.onclick = () => post('switch_tab:' + i);
+        t.onclick = () => post('switch_tab:' + tabId);
 
         const icon = document.createElement('img');
         icon.className = 'tab-icon';
@@ -1258,7 +1275,7 @@ const TOOLBAR_SCRIPT: &str = r#"
         const x = document.createElement('div');
         x.className = 'tab-close';
         x.textContent = '×';
-        x.onclick = (e) => { e.stopPropagation(); post('close_tab:' + i); };
+        x.onclick = (e) => { e.stopPropagation(); post('close_tab:' + tabId); };
 
         t.appendChild(icon);
         t.appendChild(tt);
@@ -1268,6 +1285,8 @@ const TOOLBAR_SCRIPT: &str = r#"
 
       const urlEl = document.getElementById('url');
       if (urlEl) urlEl.value = url || '';
+      const urlClear = document.getElementById('url-clear');
+      if (urlClear) urlClear.classList.toggle('visible', !!(urlEl && urlEl.value));
       const reloadBtn = document.getElementById('reload');
       if (reloadBtn) {
         reloadBtn.dataset.loading = loading ? '1' : '0';
@@ -1302,10 +1321,9 @@ const TAB_BAR_CSS: &str = r#"
       flex:1 1 auto; min-width:48px;
       height:32px;
       overflow-x:auto; overflow-y:hidden;
-      scrollbar-gutter: stable both-edges;
       scrollbar-width:thin; scrollbar-color:#5f6368 transparent;
     }
-    .tab-strip::-webkit-scrollbar { height:6px; }
+    .tab-strip::-webkit-scrollbar { height:4px; }
     .tab-strip::-webkit-scrollbar-thumb { background:#5f6368; border-radius:8px; }
     .tab-strip::-webkit-scrollbar-track { background:transparent; }
     .addtab {
@@ -1319,6 +1337,7 @@ const TAB_BAR_CSS: &str = r#"
       display:flex; align-items:center; gap:6px;
       height:32px; padding:0 34px 0 8px; border-radius:12px; background:var(--b);
       cursor:pointer; user-select:none; box-sizing:border-box;
+      flex:0 0 auto;
     }
     .tab.active { background:var(--b2); }
     .tab-icon { flex:0 0 auto; width:16px; height:16px; opacity:0.95; display:block; border-radius:4px; }
@@ -1330,15 +1349,37 @@ const TAB_BAR_CSS: &str = r#"
       position:absolute; right:4px; top:4px;
       width:24px; height:24px; border-radius:10px;
       display:grid; place-items:center; color:var(--mut); font-weight:900;
+      cursor:pointer;
       opacity:0; pointer-events:none;
     }
     .tab:hover .tab-close { opacity:1; pointer-events:auto; }
     .tab-close:hover { background:#2a2b2f; color:var(--fg); }
     .tab-strip.scroll .tab-title { display:none; }
-    .tab-strip.scroll .tab { padding:0; width:32px; border-radius:10px; display:grid; place-items:center; }
-    .tab-strip.scroll .tab-close { position:static; right:auto; top:auto; }
+    .tab-strip.scroll .tab {
+      padding:0; width:32px !important; min-width:32px !important; max-width:32px !important;
+      height:32px; border-radius:8px; display:flex; align-items:center; justify-content:center;
+      flex:0 0 32px !important;
+    }
+    .tab-strip.scroll .tab-icon { width:16px; height:16px; margin:0; }
+    .tab-strip.scroll .tab-close {
+      position:absolute; inset:0; width:32px; height:32px; margin:auto;
+      border-radius:8px;
+    }
     .tab-strip.scroll .tab:hover .tab-icon { opacity:0; }
     .tab-strip.scroll .tab:hover .tab-close { opacity:1; pointer-events:auto; }
+    .omnibox-wrap { position:relative; flex:1; min-width:200px; display:flex; }
+    .omnibox-wrap input {
+      flex:1; min-width:0; padding:10px 34px 10px 14px; border-radius:16px;
+      border:1px solid #3c4043; outline:none; background:#111; color:var(--fg);
+    }
+    .url-clear {
+      position:absolute; right:10px; top:50%; transform:translateY(-50%);
+      width:22px; height:22px; border:none; border-radius:11px;
+      background:transparent; color:var(--mut); font-size:16px; line-height:1;
+      display:none; place-items:center; cursor:pointer; padding:0;
+    }
+    .url-clear.visible { display:grid; }
+    .url-clear:hover { background:#2a2b2f; color:var(--fg); }
 "#;
 
 const WINDOWS_TAB_BAR_CSS: &str = r#"
@@ -1377,10 +1418,11 @@ const WINDOWS_TAB_LAYOUT_SCRIPT: &str = r#"
     if(minTotal>avail){
       strip.classList.add('scroll');
       tabs.forEach(function(t){
-        t.style.flex='0 0 '+TAB_MIN+'px';
-        t.style.width=TAB_MIN+'px';
-        t.style.minWidth=TAB_MIN+'px';
-        t.style.maxWidth=TAB_MIN+'px';
+        t.style.flex='0 0 32px';
+        t.style.width='32px';
+        t.style.minWidth='32px';
+        t.style.maxWidth='32px';
+        t.style.height='32px';
       });
       var active=strip.querySelector('.tab.active');
       if(active)active.scrollIntoView({inline:'nearest',block:'nearest'});
@@ -1393,6 +1435,7 @@ const WINDOWS_TAB_LAYOUT_SCRIPT: &str = r#"
       t.style.width=width+'px';
       t.style.minWidth=TAB_MIN+'px';
       t.style.maxWidth=TAB_MAX+'px';
+      t.style.height='32px';
     });
   }
   layoutTabs();
@@ -1421,9 +1464,10 @@ fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
         let active = if i == snap.current { " active" } else { "" };
         let title_esc = html_escape(title);
         let page_url = snap.urls.get(i).map(String::as_str).unwrap_or("");
+        let tab_id = snap.ids.get(i).copied().unwrap_or((i + 1) as u32);
         let icon_url = html_escape(&tab_favicon_url(page_url));
-        let switch = ipc_nav_url(&format!("switch_tab:{i}"));
-        let close = ipc_nav_url(&format!("close_tab:{i}"));
+        let switch = ipc_nav_url(&format!("switch_tab:{tab_id}"));
+        let close = ipc_nav_url(&format!("close_tab:{tab_id}"));
         tabs_html.push_str(&format!(
             r#"<div class="tab{active}" onclick="window.location.replace('{switch}')">"#
         ));
@@ -1451,6 +1495,8 @@ fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
         ("↻", "Обновить", ipc_nav_url("nav_reload"))
     };
     let nav_devtools = ipc_nav_url("nav_devtools");
+    let clear_visible = if snap.cur_url.is_empty() { "" } else { " visible" };
+    let clear_url = ipc_nav_url("clear_url");
 
     format!(
         r#"<!doctype html>
@@ -1490,12 +1536,6 @@ fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
       font-size:16px; flex:0 0 auto;
     }}
     .navbtn:hover {{ background:var(--b2); }}
-    input {{
-      flex:1; min-width:200px; padding:10px 14px; border-radius:16px;
-      border:1px solid #3c4043; outline:none; background:#111; color:var(--fg);
-    }}
-    .go {{ padding:10px 14px; border-radius:16px; background:var(--b); cursor:pointer; user-select:none; flex:0 0 auto; }}
-    .go:hover {{ background:var(--b2); }}
   </style>
 </head>
 <body>
@@ -1518,9 +1558,12 @@ fn windows_toolbar_html(snap: &ToolbarSnapshot) -> String {
         <div class="navbtn" title="Вперёд" onclick="window.location.replace('{nav_forward}')">→</div>
         <div class="navbtn" title="{nav_reload_title}" onclick="window.location.replace('{nav_reload_action}')">{nav_reload_label}</div>
         <div class="navbtn" title="Инструменты разработчика (F12)" onclick="window.location.replace('{nav_devtools}')">&#123; &#125;</div>
-        <input id="url" value="{cur_url_attr}" placeholder="{omnibox_placeholder}" autocomplete="off" spellcheck="false"
-          onkeydown="if(event.key==='Enter')window.location.replace('plum://ipc/load:'+encodeURIComponent(this.value))" />
-        <div class="go" onclick="window.location.replace('plum://ipc/load:'+encodeURIComponent(document.getElementById('url').value))">Перейти</div>
+        <div class="omnibox-wrap">
+          <input id="url" value="{cur_url_attr}" placeholder="{omnibox_placeholder}" autocomplete="off" spellcheck="false"
+            onkeydown="if(event.key==='Enter')window.location.replace('plum://ipc/load:'+encodeURIComponent(this.value))" />
+          <button type="button" class="url-clear{clear_visible}" title="Очистить"
+            onclick="event.stopPropagation();window.location.replace('{clear_url}')">×</button>
+        </div>
       </div>
     </div>
   </div>
@@ -1555,7 +1598,7 @@ fn toolbar_html() -> String {
     .tabs-wrap {{ padding:28px 12px 0; -webkit-app-region:drag; }}
     {tab_bar_css}
     .tabs-bar {{ -webkit-app-region:no-drag; }}
-    .addtab, .tab, .navbtn, input, .go {{ -webkit-app-region:no-drag; }}
+    .addtab, .tab, .navbtn, .omnibox-wrap, input, .url-clear {{ -webkit-app-region:no-drag; }}
     .nav-row {{ display:flex; gap:8px; align-items:center; padding:8px 12px 10px; }}
     .navbtn {{
       width:36px; height:36px; border-radius:12px; background:var(--b);
@@ -1563,15 +1606,6 @@ fn toolbar_html() -> String {
       font-size:16px; flex:0 0 auto;
     }}
     .navbtn:hover {{ background:var(--b2); }}
-    input {{
-      flex:1; min-width:200px; padding:10px 14px; border-radius:16px;
-      border:1px solid #3c4043; outline:none; background:#111; color:var(--fg);
-    }}
-    .go {{
-      padding:10px 14px; border-radius:16px; background:var(--b);
-      cursor:pointer; user-select:none; flex:0 0 auto;
-    }}
-    .go:hover {{ background:var(--b2); }}
   </style>
 </head>
 <body>
@@ -1588,8 +1622,10 @@ fn toolbar_html() -> String {
       <div class="navbtn" id="forward" title="Вперёд">→</div>
       <div class="navbtn" id="reload" title="Обновить">↻</div>
       <div class="navbtn" id="devtools" title="Инструменты разработчика (F12)">&#123; &#125;</div>
-      <input id="url" placeholder="{omnibox_placeholder}" autocomplete="off" spellcheck="false" />
-      <div class="go" id="go">Перейти</div>
+      <div class="omnibox-wrap">
+        <input id="url" placeholder="{omnibox_placeholder}" autocomplete="off" spellcheck="false" />
+        <button type="button" class="url-clear" id="url-clear" title="Очистить">×</button>
+      </div>
     </div>
   </div>
   <script>window.__plumBrowserIcon={browser_icon};</script>
@@ -1670,8 +1706,10 @@ fn toolbar_html() -> String {
         <div class="navbtn" id="forward" title="Вперёд">→</div>
         <div class="navbtn" id="reload" title="Обновить">↻</div>
         <div class="navbtn" id="devtools" title="Инструменты разработчика (F12)">&#123; &#125;</div>
-        <input id="url" placeholder="{omnibox_placeholder}" autocomplete="off" spellcheck="false" />
-        <div class="go" id="go">Перейти</div>
+        <div class="omnibox-wrap">
+          <input id="url" placeholder="{omnibox_placeholder}" autocomplete="off" spellcheck="false" />
+          <button type="button" class="url-clear" id="url-clear" title="Очистить">×</button>
+        </div>
       </div>
     </div>
   </div>
@@ -1819,12 +1857,6 @@ fn show_tab(
     if devtools_open {
         if let Some(tab) = tabs.get(current) {
             open_docked_devtools(&tab.webview);
-            #[cfg(target_os = "windows")]
-            if let Some(panel) = devtools_panel {
-                sync_windows_devtools(panel, tab, true);
-            } else {
-                request_devtools_panel();
-            }
         }
     }
     focus_active_tab(tabs, current);
@@ -1888,27 +1920,26 @@ fn toggle_devtools(
         return;
     };
 
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (window, toolbar, ww, wh, devtools_panel);
+        if *devtools_open {
+            close_docked_devtools(&tab.webview);
+            *devtools_open = false;
+        } else {
+            open_docked_devtools(&tab.webview);
+            *devtools_open = true;
+        }
+        focus_active_tab(tabs, current);
+        return;
+    }
+
     if *devtools_open {
         close_docked_devtools(&tab.webview);
-        #[cfg(target_os = "windows")]
-        {
-            cancel_devtools_panel_request();
-            if let Some(panel) = devtools_panel {
-                sync_windows_devtools(panel, tab, false);
-            }
-        }
         *devtools_open = false;
     } else {
         *devtools_open = true;
         open_docked_devtools(&tab.webview);
-        #[cfg(target_os = "windows")]
-        if let Some(panel) = devtools_panel {
-            sync_windows_devtools(panel, tab, true);
-        }
-        #[cfg(target_os = "windows")]
-        if devtools_panel.is_none() {
-            request_devtools_panel();
-        }
     }
 
     resize_all(
@@ -1935,6 +1966,57 @@ fn find_tab_idx(tabs: &[Tab], tab_id: u32) -> Option<usize> {
     tabs.iter().position(|t| t.id == tab_id)
 }
 
+#[cfg(target_os = "macos")]
+enum MacEditCommand {
+    Copy,
+    Cut,
+    Paste,
+    SelectAll,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_send_edit(webview: &WebView, command: MacEditCommand) {
+    let script = match command {
+        MacEditCommand::Copy => "document.execCommand('copy')",
+        MacEditCommand::Cut => "document.execCommand('cut')",
+        MacEditCommand::Paste => "document.execCommand('paste')",
+        MacEditCommand::SelectAll => "document.execCommand('selectAll')",
+    };
+    let _ = webview.focus();
+    let _ = webview.evaluate_script(script);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_handle_edit_shortcut(
+    tabs: &[Tab],
+    current: usize,
+    toolbar: &WebView,
+    toolbar_focused: bool,
+    command: MacEditCommand,
+) {
+    if toolbar_focused {
+        macos_send_edit(toolbar, command);
+        return;
+    }
+    if let Some(tab) = tabs.get(current) {
+        macos_send_edit(&tab.webview, command);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_edit_from_key(key: KeyCode, super_key: bool) -> Option<MacEditCommand> {
+    if !super_key {
+        return None;
+    }
+    match key {
+        KeyCode::KeyA => Some(MacEditCommand::SelectAll),
+        KeyCode::KeyC => Some(MacEditCommand::Copy),
+        KeyCode::KeyV => Some(MacEditCommand::Paste),
+        KeyCode::KeyX => Some(MacEditCommand::Cut),
+        _ => None,
+    }
+}
+
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
     #[cfg(not(target_os = "windows"))]
     let proxy_page = proxy.clone();
@@ -1947,6 +2029,7 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         .with_visible(true)
         .with_focused(true)
         .with_accept_first_mouse(true)
+        .with_clipboard(true)
         .with_devtools(false)
         .with_hotkeys_zoom(false)
         .with_back_forward_navigation_gestures(false)
@@ -2060,7 +2143,7 @@ fn open_new_tab(
         url,
         ww,
         wh,
-        true,
+        false,
         devtools_open,
     );
     tabs.push(Tab {
@@ -2071,14 +2154,9 @@ fn open_new_tab(
         webview,
     });
     *current = tabs.len() - 1;
+    let _ = tabs[*current].webview.set_visible(true);
     if devtools_open {
         open_docked_devtools(&tabs[*current].webview);
-        #[cfg(target_os = "windows")]
-        if let Some(panel) = devtools_panel {
-            sync_windows_devtools(panel, &tabs[*current], true);
-        } else {
-            request_devtools_panel();
-        }
     }
     sync_toolbar(toolbar, tabs, *current);
     resize_all(
@@ -2414,6 +2492,127 @@ fn content_load_url(webview: &WebView, url: &str) {
     }
 }
 
+static OPEN_TAB_QUEUE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static TAB_BUILDING: AtomicBool = AtomicBool::new(false);
+static TOOLBAR_FOCUSED: AtomicBool = AtomicBool::new(false);
+
+fn optimistic_toolbar_new_tab(toolbar: &WebView, tabs: &[Tab], next_id: u32) {
+    let mut ids: Vec<u32> = tabs.iter().map(|t| t.id).collect();
+    ids.push(next_id);
+    let mut titles: Vec<String> = tabs.iter().map(tab_label).collect();
+    titles.push("Новая вкладка".to_string());
+    let urls: Vec<String> = tabs
+        .iter()
+        .map(|t| omnibox_display_url(&logical_tab_url(&t.url)))
+        .chain(std::iter::once(String::new()))
+        .collect();
+    let current = tabs.len();
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut snap = toolbar_snapshot()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        snap.ids = ids;
+        snap.titles = titles;
+        snap.urls = urls;
+        snap.current = current;
+        snap.cur_url.clear();
+        snap.loading = false;
+        TOOLBAR_DIRTY.store(true, Ordering::SeqCst);
+        return;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let script = format!(
+            "window.__setState({}, {}, {}, {}, {}, false);",
+            json!(ids),
+            json!(titles),
+            json!(urls),
+            current,
+            json!(""),
+        );
+        let _ = toolbar.evaluate_script(&script);
+    }
+}
+
+fn queue_open_tab(
+    toolbar: &WebView,
+    tabs: &[Tab],
+    next_id: u32,
+    url: &str,
+    proxy: &EventLoopProxy<UserEvent>,
+) {
+    optimistic_toolbar_new_tab(toolbar, tabs, next_id);
+    #[cfg(target_os = "windows")]
+    {
+        if TOOLBAR_DIRTY.load(Ordering::SeqCst) {
+            let snap = toolbar_snapshot()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let _ = toolbar.load_url(&windows_toolbar_data_url(&snap));
+            TOOLBAR_DIRTY.store(false, Ordering::SeqCst);
+        }
+    }
+    OPEN_TAB_QUEUE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(url.to_string());
+    let _ = proxy.send_event(UserEvent::OpenTab);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_open_tab_queue(
+    window: &Window,
+    proxy: &EventLoopProxy<UserEvent>,
+    toolbar: &WebView,
+    tabs: &mut Vec<Tab>,
+    current: &mut usize,
+    next_id: &mut u32,
+    ww: f64,
+    wh: f64,
+    devtools_open: bool,
+    #[cfg(target_os = "windows")] devtools_panel: Option<&WebView>,
+) {
+    if TAB_BUILDING.load(Ordering::SeqCst) {
+        return;
+    }
+    let url = {
+        let mut queue = OPEN_TAB_QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if queue.is_empty() {
+            return;
+        }
+        queue.remove(0)
+    };
+    TAB_BUILDING.store(true, Ordering::SeqCst);
+    open_new_tab(
+        window,
+        proxy,
+        tabs,
+        current,
+        next_id,
+        toolbar,
+        &url,
+        ww,
+        wh,
+        devtools_open,
+        #[cfg(target_os = "windows")]
+        devtools_panel,
+    );
+    TAB_BUILDING.store(false, Ordering::SeqCst);
+    if !OPEN_TAB_QUEUE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+    {
+        let _ = proxy.send_event(UserEvent::OpenTab);
+    }
+}
+
 struct IpcContext<'a> {
     control_flow: &'a mut ControlFlow,
     window: &'a Window,
@@ -2476,7 +2675,33 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
             #[cfg(target_os = "windows")]
             log_windows_layout(ctx.toolbar, ctx.tabs, "toolbar_ready");
         }
-        "focus_content" => focus_active_tab(ctx.tabs, *ctx.current),
+        "focus_content" => {
+            TOOLBAR_FOCUSED.store(false, Ordering::SeqCst);
+            focus_active_tab(ctx.tabs, *ctx.current);
+        }
+        "focus_toolbar" => {
+            TOOLBAR_FOCUSED.store(true, Ordering::SeqCst);
+        }
+        "clear_url" => {
+            #[cfg(target_os = "windows")]
+            {
+                let mut snap = toolbar_snapshot()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                snap.cur_url.clear();
+                TOOLBAR_DIRTY.store(true, Ordering::SeqCst);
+            }
+            sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
+            #[cfg(target_os = "windows")]
+            {
+                let snap = toolbar_snapshot()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let _ = ctx.toolbar.load_url(&windows_toolbar_data_url(&snap));
+                TOOLBAR_DIRTY.store(false, Ordering::SeqCst);
+            }
+        }
         "nav_back" => {
             webview_go_back(&ctx.tabs[*ctx.current].webview);
             focus_active_tab(ctx.tabs, *ctx.current);
@@ -2532,25 +2757,18 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
             }
         }
         _ if msg.starts_with("new_tab:") => {
-            open_new_tab(
-                ctx.window,
-                ctx.proxy,
-                ctx.tabs,
-                ctx.current,
-                ctx.next_id,
+            queue_open_tab(
                 ctx.toolbar,
+                ctx.tabs,
+                *ctx.next_id,
                 NEWTAB_URL,
-                *ctx.ww,
-                *ctx.wh,
-                *ctx.devtools_open,
-                #[cfg(target_os = "windows")]
-                ctx.devtools_panel,
+                ctx.proxy,
             );
         }
         _ if msg.starts_with("switch_tab:") => {
             if let Some(rest) = msg.strip_prefix("switch_tab:") {
-                if let Ok(idx) = rest.trim().parse::<usize>() {
-                    if idx < ctx.tabs.len() {
+                if let Ok(tab_id) = rest.trim().parse::<u32>() {
+                    if let Some(idx) = find_tab_idx(ctx.tabs, tab_id) {
                         *ctx.current = idx;
                         show_tab(
                             ctx.window,
@@ -2570,23 +2788,16 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
         }
         _ if msg.starts_with("close_tab:") => {
             if let Some(rest) = msg.strip_prefix("close_tab:") {
-                if let Ok(idx) = rest.trim().parse::<usize>() {
-                    if idx < ctx.tabs.len() {
+                if let Ok(tab_id) = rest.trim().parse::<u32>() {
+                    if let Some(idx) = find_tab_idx(ctx.tabs, tab_id) {
                         ctx.tabs.remove(idx);
                         if ctx.tabs.is_empty() {
-                            open_new_tab(
-                                ctx.window,
-                                ctx.proxy,
-                                ctx.tabs,
-                                ctx.current,
-                                ctx.next_id,
+                            queue_open_tab(
                                 ctx.toolbar,
+                                ctx.tabs,
+                                *ctx.next_id,
                                 NEWTAB_URL,
-                                *ctx.ww,
-                                *ctx.wh,
-                                *ctx.devtools_open,
-                                #[cfg(target_os = "windows")]
-                                ctx.devtools_panel,
+                                ctx.proxy,
                             );
                         } else {
                             if idx < *ctx.current {
@@ -2606,6 +2817,15 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
                                 ctx.devtools_panel,
                             );
                             sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
+                            #[cfg(target_os = "windows")]
+                            {
+                                let snap = toolbar_snapshot()
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone();
+                                let _ = ctx.toolbar.load_url(&windows_toolbar_data_url(&snap));
+                                TOOLBAR_DIRTY.store(false, Ordering::SeqCst);
+                            }
                         }
                     }
                 }
@@ -2706,18 +2926,31 @@ fn dispatch_app_event(
                         ..
                     },
                 ..
-            } if devtools_shortcut(physical_key, *modifiers) => {
-                toggle_devtools(
-                    window,
-                    toolbar,
-                    tabs,
-                    *current,
-                    devtools_open,
-                    *ww,
-                    *wh,
-                    #[cfg(target_os = "windows")]
-                    devtools_panel,
-                );
+            } => {
+                #[cfg(target_os = "macos")]
+                if let Some(cmd) = macos_edit_from_key(physical_key, modifiers.super_key()) {
+                    macos_handle_edit_shortcut(
+                        tabs,
+                        *current,
+                        toolbar,
+                        TOOLBAR_FOCUSED.load(Ordering::SeqCst),
+                        cmd,
+                    );
+                    return;
+                }
+                if devtools_shortcut(physical_key, *modifiers) {
+                    toggle_devtools(
+                        window,
+                        toolbar,
+                        tabs,
+                        *current,
+                        devtools_open,
+                        *ww,
+                        *wh,
+                        #[cfg(target_os = "windows")]
+                        devtools_panel,
+                    );
+                }
             }
 
             WindowEvent::Focused(true) => {
@@ -2727,6 +2960,22 @@ fn dispatch_app_event(
 
             _ => {}
         },
+
+        Event::UserEvent(UserEvent::OpenTab) => {
+            drain_open_tab_queue(
+                window,
+                proxy,
+                toolbar,
+                tabs,
+                current,
+                next_id,
+                *ww,
+                *wh,
+                *devtools_open,
+                #[cfg(target_os = "windows")]
+                devtools_panel,
+            );
+        }
 
         Event::UserEvent(UserEvent::ToggleDevtools) => {
             toggle_devtools(
@@ -2825,20 +3074,7 @@ fn dispatch_app_event(
 
         Event::UserEvent(UserEvent::NewWindow { url }) => {
             if let Some(url) = resolve_omnibox_input(&url) {
-                open_new_tab(
-                    window,
-                    proxy,
-                    tabs,
-                    current,
-                    next_id,
-                    toolbar,
-                    &url,
-                    *ww,
-                    *wh,
-                    *devtools_open,
-                    #[cfg(target_os = "windows")]
-                    devtools_panel,
-                );
+                queue_open_tab(toolbar, tabs, *next_id, &url, proxy);
             }
         }
 
@@ -2866,6 +3102,18 @@ fn dispatch_app_event(
 
         #[cfg(target_os = "windows")]
         Event::MainEventsCleared => {
+            drain_open_tab_queue(
+                window,
+                proxy,
+                toolbar,
+                tabs,
+                current,
+                next_id,
+                *ww,
+                *wh,
+                *devtools_open,
+                devtools_panel,
+            );
             if let Some(nudges) = z_order_nudges {
                 if let Some(panel) = devtools_panel {
                     if *nudges < 60 {
@@ -2874,6 +3122,21 @@ fn dispatch_app_event(
                     }
                 }
             }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        Event::MainEventsCleared => {
+            drain_open_tab_queue(
+                window,
+                proxy,
+                toolbar,
+                tabs,
+                current,
+                next_id,
+                *ww,
+                *wh,
+                *devtools_open,
+            );
         }
 
         _ => {}
@@ -2937,7 +3200,7 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
                 NEWTAB_URL,
                 app.ww,
                 app.wh,
-                true,
+                false,
                 app.devtools_open,
             );
             app.tabs.push(Tab {
@@ -2947,6 +3210,7 @@ fn bootstrap_win_app(app: &mut WindowsRunState) {
                 loading: false,
                 webview,
             });
+            let _ = app.tabs[0].webview.set_visible(true);
             app.current = 0;
             app.next_id = 2;
 
