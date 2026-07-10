@@ -1783,7 +1783,7 @@ fn build_content_webview(
     #[cfg(target_os = "windows")]
     let builder = builder
         .with_browser_accelerator_keys(false)
-        .with_additional_browser_arguments("--remote-debugging-port=9222");
+        .with_additional_browser_args("--remote-debugging-port=9222");
 
     let is_newtab = url == NEWTAB_URL || is_internal_newtab_url(url);
     let webview = if is_newtab {
