@@ -5,7 +5,7 @@ echo Stopping PlumBrowser if running...
 taskkill /IM plumbrowser.exe /F >nul 2>&1
 
 rem CDP for docked DevTools — must be set before the process starts.
-set "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222"
+set "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222 --remote-allow-origins=*"
 
 if /I "%~1"=="release" (
   echo cargo build --release...

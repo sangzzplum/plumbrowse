@@ -1296,6 +1296,9 @@ const TOOLBAR_SCRIPT: &str = r#"
           t.style.minWidth = TAB_MIN + 'px';
           t.style.maxWidth = TAB_MAX + 'px';
           t.style.height = '32px';
+          t.style.margin = '';
+          t.style.padding = '';
+          t.style.boxSizing = '';
         });
 
         const addInline = document.getElementById('addtab-inline');
@@ -1406,24 +1409,29 @@ const TAB_BAR_CSS: &str = r#"
     .tab {
       position:relative;
       display:flex; align-items:center; gap:6px;
-      height:32px; padding:0 34px 0 8px; border-radius:12px; background:var(--b);
+      height:32px; padding:0 8px; border-radius:12px; background:var(--b);
       cursor:pointer; user-select:none; box-sizing:border-box;
-      flex:0 0 auto;
+      flex:0 0 auto; min-width:32px; overflow:hidden;
     }
     .tab.active { background:var(--b2); }
     .tab-icon { flex:0 0 auto; width:16px; height:16px; opacity:0.95; display:block; border-radius:4px; }
     .tab-title {
       min-width:0; overflow:hidden; white-space:nowrap;
       text-overflow:ellipsis; flex:1 1 auto;
+      padding-right:2px;
     }
     .tab-close {
-      position:absolute; right:4px; top:4px;
-      width:24px; height:24px; border-radius:10px;
+      position:absolute; right:2px; top:50%; transform:translateY(-50%);
+      width:22px; height:22px; border-radius:8px;
       display:grid; place-items:center; color:var(--mut); font-weight:900;
-      cursor:pointer;
+      cursor:pointer; z-index:2;
       opacity:0; pointer-events:none;
     }
-    .tab:hover .tab-close, .tab.active .tab-close { opacity:1; pointer-events:auto; }
+    .tab:hover .tab-close, .tab.active .tab-close {
+      opacity:1; pointer-events:auto;
+      background:var(--b);
+    }
+    .tab.active .tab-close { background:var(--b2); }
     .tab-close:hover { background:#2a2b2f; color:var(--fg); }
     .tab-strip.scroll .tab-title { display:none !important; }
     .tab-strip.scroll .tab {
@@ -1828,7 +1836,10 @@ fn build_content_webview(
     devtools_open: bool,
 ) -> WebView {
     #[cfg(target_os = "windows")]
-    let content_init = format!("{CONTENT_SHORTCUT_SCRIPT}\n{WIN_CONTENT_CONTEXT_SCRIPT}");
+    let content_init = format!(
+        "{CONTENT_SHORTCUT_SCRIPT}\n{WIN_CONTENT_CONTEXT_SCRIPT}\n{}",
+        content_tab_marker_script(tab_id)
+    );
     #[cfg(target_os = "macos")]
     let content_init = format!("{CONTENT_SHORTCUT_SCRIPT}\n{MAC_EDIT_SCRIPT}");
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -2206,10 +2217,51 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
 }
 
 #[cfg(target_os = "windows")]
+fn content_tab_marker_script(tab_id: u32) -> String {
+    format!(
+        r#"(function(id){{
+  function mark(){{
+    var m='PlumTab:'+id;
+    var t=document.title||'';
+    if(t.indexOf(m)===0)return;
+    var base=t.replace(/^PlumTab:\d+\s*/,'').trim();
+    document.title=base?m+' '+base:m;
+  }}
+  mark();
+  document.addEventListener('DOMContentLoaded',mark);
+  document.addEventListener('readystatechange',mark);
+}})({tab_id});"#,
+        tab_id = tab_id
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn stamp_cdp_tab_title(webview: &WebView, tab_id: u32) {
+    let _ = webview.evaluate_script(&content_tab_marker_script(tab_id));
+}
+
+#[cfg(target_os = "windows")]
 const DEVTOOLS_PANEL_HTML: &str = r#"<!doctype html>
 <html><head><meta charset="utf-8"/><style>
-  html,body{margin:0;height:100%;background:#1e1e1e;overflow:hidden}
-</style></head><body></body></html>"#;
+  html,body{margin:0;height:100%;background:#1e1e1e;overflow:hidden;color:#9aa0a6;
+    font:13px/1.4 system-ui,"Segoe UI",Arial,sans-serif}
+  body{display:flex;align-items:center;justify-content:center;padding:16px;text-align:center}
+</style></head><body><div id="msg">Подключение DevTools…</div></body></html>"#;
+
+#[cfg(target_os = "windows")]
+fn devtools_error_data_url(message: &str) -> String {
+    let body = format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"/><style>
+  html,body{{margin:0;height:100%;background:#1e1e1e;color:#9aa0a6;
+    font:13px/1.4 system-ui,"Segoe UI",Arial,sans-serif}}
+  body{{display:flex;align-items:center;justify-content:center;padding:16px;text-align:center}}
+</style></head><body>{message}</body></html>"#
+    );
+    format!(
+        "data:text/html;charset=utf-8,{}",
+        percent_encode_ipc_path(&body)
+    )
+}
 
 #[cfg(target_os = "windows")]
 fn build_devtools_panel(window: &Window, ww: f64, wh: f64) -> WebView {
@@ -2221,7 +2273,9 @@ fn build_devtools_panel(window: &Window, ww: f64, wh: f64) -> WebView {
         .with_devtools(false)
         .with_hotkeys_zoom(false)
         .with_navigation_handler(|url| {
-            url.starts_with("http://127.0.0.1:9222") || url.starts_with("about:")
+            url.starts_with("http://127.0.0.1:9222")
+                || url.starts_with("about:")
+                || url.starts_with("data:text/html")
         })
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
         .with_default_context_menus(false)
@@ -2325,6 +2379,7 @@ struct WindowsRunState {
 
 #[cfg(target_os = "windows")]
 struct DevtoolsConnectState {
+    tab_id: u32,
     page_url: String,
     attempts: u32,
 }
@@ -2365,15 +2420,21 @@ fn devtools_connect_slot() -> &'static Mutex<Option<DevtoolsConnectState>> {
 #[cfg(target_os = "windows")]
 fn sync_windows_devtools(panel: &WebView, tab: &Tab, open: bool) {
     if open {
+        stamp_cdp_tab_title(&tab.webview, tab.id);
         let page_url = logical_tab_url(&tab.url);
         *devtools_connect_slot()
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(DevtoolsConnectState {
+            tab_id: tab.id,
             page_url,
             attempts: 0,
         });
         let _ = panel.set_visible(true);
-        log_windows_debug("devtools: connecting docked panel");
+        let _ = panel.load_url("about:blank");
+        let _ = panel.evaluate_script(
+            "document.body.innerHTML='<div style=\"display:flex;align-items:center;justify-content:center;height:100%;color:#9aa0a6;font:13px system-ui\">Подключение DevTools…</div>';",
+        );
+        log_windows_debug(&format!("devtools: connecting docked panel for tab {}", tab.id));
     } else {
         *devtools_connect_slot()
             .lock()
@@ -2407,18 +2468,18 @@ fn tick_devtools_connect(app: &mut WindowsRunState) {
             return;
         }
         state.attempts += 1;
-        Some((state.page_url.clone(), state.attempts))
+        Some((state.tab_id, state.page_url.clone(), state.attempts))
     };
 
-    let Some((page_url, attempts)) = poll else {
+    let Some((tab_id, page_url, attempts)) = poll else {
         return;
     };
     let Some(panel) = app.devtools_panel.as_ref() else {
         return;
     };
 
-    if let Some(url) = win_devtools::inspector_url_for_page(&page_url) {
-        log_windows_debug("devtools: inspector ready");
+    if let Some(url) = win_devtools::inspector_url_for_tab(tab_id, &page_url) {
+        log_windows_debug(&format!("devtools: inspector ready for tab {tab_id}"));
         let _ = panel.load_url(&url);
         let _ = panel.set_visible(true);
         raise_toolbar(
@@ -2434,23 +2495,9 @@ fn tick_devtools_connect(app: &mut WindowsRunState) {
     }
 
     if attempts >= DEVTOOLS_CONNECT_MAX {
-        log_windows_debug("devtools: CDP connect timed out, opening DevTools window");
-        if let Some(tab) = app.tabs.get(app.current) {
-            tab.webview.open_devtools();
-        }
-        if let Some(panel) = app.devtools_panel.as_ref() {
-            win_devtools::close_panel(panel);
-        }
-        app.devtools_open = false;
-        resize_all(
-            &app.window,
-            &app.toolbar,
-            &app.tabs,
-            app.ww,
-            app.wh,
-            false,
-            app.devtools_panel.as_ref(),
-        );
+        log_windows_debug(&format!("devtools: CDP connect timed out for tab {tab_id}"));
+        let msg = "DevTools не удалось подключить.<br>Перезапустите браузер и попробуйте снова.";
+        let _ = panel.load_url(&devtools_error_data_url(msg));
         *devtools_connect_slot()
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
@@ -3195,6 +3242,8 @@ fn dispatch_app_event(
         Event::UserEvent(UserEvent::LoadFinished { tab_id }) => {
             if let Some(idx) = find_tab_idx(tabs, tab_id) {
                 tabs[idx].loading = false;
+                #[cfg(target_os = "windows")]
+                stamp_cdp_tab_title(&tabs[idx].webview, tab_id);
                 if idx == *current {
                     sync_toolbar(toolbar, tabs, *current);
                 }
@@ -3218,7 +3267,10 @@ fn dispatch_app_event(
             if let Some(idx) = find_tab_idx(tabs, tab_id) {
                 tabs[idx].title = title;
                 #[cfg(target_os = "windows")]
-                sync_toolbar(toolbar, tabs, *current);
+                {
+                    stamp_cdp_tab_title(&tabs[idx].webview, tab_id);
+                    sync_toolbar(toolbar, tabs, *current);
+                }
                 #[cfg(not(target_os = "windows"))]
                 {
                     let titles = tabs.iter().map(tab_label).collect::<Vec<_>>();
@@ -3470,16 +3522,18 @@ fn run_windows_app(
 #[cfg(target_os = "windows")]
 fn ensure_webview2_debug_port() {
     const VAR: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
-    const FLAG: &str = "--remote-debugging-port=9222";
-    match std::env::var(VAR) {
-        Ok(existing) if existing.contains("remote-debugging-port") => {}
-        Ok(existing) => {
-            std::env::set_var(VAR, format!("{existing} {FLAG}"));
-        }
-        Err(_) => {
-            std::env::set_var(VAR, FLAG);
+    let mut args = std::env::var(VAR).unwrap_or_default();
+    if !args.contains("remote-debugging-port") {
+        if args.is_empty() {
+            args = "--remote-debugging-port=9222".to_string();
+        } else {
+            args = format!("{args} --remote-debugging-port=9222");
         }
     }
+    if !args.contains("remote-allow-origins") {
+        args = format!("{args} --remote-allow-origins=*");
+    }
+    std::env::set_var(VAR, args);
 }
 
 fn main() {
@@ -3624,9 +3678,9 @@ mod win_devtools {
         let _ = panel.load_url("about:blank");
     }
 
-    pub fn inspector_url_for_page(page_url: &str) -> Option<String> {
+    pub fn inspector_url_for_tab(tab_id: u32, page_url: &str) -> Option<String> {
         let targets = fetch_targets()?;
-        pick_target(&targets, page_url).and_then(|target| {
+        pick_target_for_tab(&targets, tab_id, page_url).and_then(|target| {
             if let Some(path) = target.get("devtoolsFrontendUrl").and_then(|v| v.as_str()) {
                 return Some(frontend_url(path));
             }
@@ -3636,6 +3690,37 @@ mod win_devtools {
                 ws.trim_start_matches("ws://")
             ))
         })
+    }
+
+    fn is_devtools_chrome_target(url: &str) -> bool {
+        url.contains("inspector.html") || url.contains("/devtools/bundled/")
+    }
+
+    fn pick_target_for_tab<'a>(
+        targets: &'a [Value],
+        tab_id: u32,
+        page_url: &str,
+    ) -> Option<&'a Value> {
+        let marker = format!("PlumTab:{tab_id}");
+        let pages: Vec<&Value> = targets
+            .iter()
+            .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+            .filter(|t| {
+                t.get("url")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|url| !is_devtools_chrome_target(url))
+            })
+            .collect();
+
+        if let Some(hit) = pages.iter().copied().find(|t| {
+            t.get("title")
+                .and_then(|v| v.as_str())
+                .is_some_and(|title| title.starts_with(&marker))
+        }) {
+            return Some(hit);
+        }
+
+        pick_target(&pages, page_url)
     }
 
     fn frontend_url(path: &str) -> String {
@@ -3648,8 +3733,8 @@ mod win_devtools {
 
     fn fetch_targets() -> Option<Vec<Value>> {
         let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_millis(80))
-            .timeout_read(Duration::from_millis(80))
+            .timeout_connect(Duration::from_millis(150))
+            .timeout_read(Duration::from_millis(150))
             .build();
         for endpoint in ["/json/list", "/json"] {
             if let Ok(resp) = agent.get(&format!("{CDP_BASE}{endpoint}")).call() {
@@ -3685,13 +3770,8 @@ mod win_devtools {
         false
     }
 
-    fn pick_target<'a>(targets: &'a [Value], page_url: &str) -> Option<&'a Value> {
-        let pages: Vec<&Value> = targets
-            .iter()
-            .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
-            .collect();
-
-        pages
+    fn pick_target<'a>(targets: &'a [&Value], page_url: &str) -> Option<&'a Value> {
+        targets
             .iter()
             .copied()
             .find(|t| {
@@ -3700,11 +3780,15 @@ mod win_devtools {
                     .is_some_and(|u| target_matches_page(u, page_url))
             })
             .or_else(|| {
-                pages
+                targets
                     .iter()
                     .copied()
-                    .find(|t| t.get("url").and_then(|v| v.as_str()).is_some_and(|u| !u.is_empty()))
+                    .find(|t| {
+                        t.get("url").and_then(|v| v.as_str()).is_some_and(|u| {
+                            !u.is_empty() && u != "about:blank"
+                        })
+                    })
             })
-            .or_else(|| pages.last().copied())
+            .or_else(|| targets.last().copied())
     }
 }
