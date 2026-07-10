@@ -45,11 +45,11 @@ fn logical_size_from_physical(size: PhysicalSize<u32>, scale: f64) -> (f64, f64)
 
 fn toolbar_height() -> f64 {
     if cfg!(target_os = "macos") {
-        118.0
+        134.0
     } else if cfg!(target_os = "windows") {
-        152.0
+        160.0
     } else {
-        152.0
+        160.0
     }
 }
 
@@ -354,12 +354,14 @@ fn webview_go_back(webview: &WebView) {
     }
 }
 
-fn open_docked_devtools(webview: &WebView) {
-    let _ = webview.open_devtools();
+fn open_docked_devtools(_webview: &WebView) {
+    #[cfg(not(target_os = "windows"))]
+    _webview.open_devtools();
 }
 
-fn close_docked_devtools(webview: &WebView) {
-    let _ = webview.close_devtools();
+fn close_docked_devtools(_webview: &WebView) {
+    #[cfg(not(target_os = "windows"))]
+    _webview.close_devtools();
 }
 
 fn webview_go_forward(webview: &WebView) {
@@ -431,6 +433,18 @@ const TOOLBAR_LOCK_SCRIPT: &str = r#"
       e.preventDefault();
       e.stopPropagation();
     }
+  }, true);
+"#;
+
+#[cfg(target_os = "macos")]
+const MAC_EDIT_SCRIPT: &str = r#"
+  document.addEventListener('keydown', function(e) {
+    if (!e.metaKey || e.altKey || e.ctrlKey) return;
+    var cmd = { a: 'selectAll', c: 'copy', v: 'paste', x: 'cut' }[e.key.toLowerCase()];
+    if (!cmd) return;
+    e.preventDefault();
+    e.stopPropagation();
+    try { document.execCommand(cmd); } catch (err) {}
   }, true);
 "#;
 
@@ -850,51 +864,20 @@ fn tab_label(tab: &Tab) -> String {
 }
 
 /// Keep logical URLs in tab state and the omnibox (never show data: document URLs).
-fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
-    let titles: Vec<String> = tabs.iter().map(tab_label).collect();
+fn toolbar_set_state_script(tabs: &[Tab], current: usize) -> String {
     let ids: Vec<u32> = tabs.iter().map(|t| t.id).collect();
-
-    #[cfg(target_os = "windows")]
-    {
-        let loading = tabs.get(current).map(|t| t.loading).unwrap_or(false);
-        let cur_url = tabs
-            .get(current)
-            .map(|t| omnibox_display_url(&t.url))
-            .unwrap_or_default();
-        let urls: Vec<String> = tabs
-            .iter()
-            .map(|t| omnibox_display_url(&logical_tab_url(&t.url)))
-            .collect();
-        {
-            let mut snap = toolbar_snapshot()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            snap.ids = ids;
-            snap.titles = titles;
-            snap.urls = urls;
-            snap.current = current;
-            snap.cur_url = cur_url;
-            snap.loading = loading;
-        }
-        TOOLBAR_DIRTY.store(true, Ordering::SeqCst);
-        return;
-    }
-
-    #[cfg(not(target_os = "windows"))]
+    let titles: Vec<String> = tabs.iter().map(tab_label).collect();
     let urls: Vec<String> = tabs
         .iter()
         .map(|t| omnibox_display_url(&logical_tab_url(&t.url)))
         .collect();
-    #[cfg(not(target_os = "windows"))]
     let cur_url = tabs
         .get(current)
         .map(|t| omnibox_display_url(&t.url))
         .unwrap_or_default();
-    #[cfg(not(target_os = "windows"))]
     let loading = tabs.get(current).map(|t| t.loading).unwrap_or(false);
 
-    #[cfg(not(target_os = "windows"))]
-    let script = format!(
+    format!(
         r#"(function(){{
   var ids = {ids};
   var titles = {titles};
@@ -923,10 +906,50 @@ fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
         urls = json!(urls),
         current = current,
         cur_url = json!(cur_url),
-        loading = json!(loading)
-    );
-    #[cfg(not(target_os = "windows"))]
-    let _ = toolbar.evaluate_script(&script);
+        loading = json!(loading),
+    )
+}
+
+fn toolbar_apply_state(toolbar: &WebView, tabs: &[Tab], current: usize) -> bool {
+    toolbar
+        .evaluate_script(&toolbar_set_state_script(tabs, current))
+        .is_ok()
+}
+
+fn sync_toolbar(toolbar: &WebView, tabs: &[Tab], current: usize) {
+    #[cfg(target_os = "windows")]
+    {
+        let loading = tabs.get(current).map(|t| t.loading).unwrap_or(false);
+        let cur_url = tabs
+            .get(current)
+            .map(|t| omnibox_display_url(&t.url))
+            .unwrap_or_default();
+        let titles: Vec<String> = tabs.iter().map(tab_label).collect();
+        let ids: Vec<u32> = tabs.iter().map(|t| t.id).collect();
+        let urls: Vec<String> = tabs
+            .iter()
+            .map(|t| omnibox_display_url(&logical_tab_url(&t.url)))
+            .collect();
+        {
+            let mut snap = toolbar_snapshot()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            snap.ids = ids;
+            snap.titles = titles;
+            snap.urls = urls;
+            snap.current = current;
+            snap.cur_url = cur_url;
+            snap.loading = loading;
+        }
+        if toolbar_apply_state(toolbar, tabs, current) {
+            TOOLBAR_DIRTY.store(false, Ordering::SeqCst);
+            return;
+        }
+        TOOLBAR_DIRTY.store(true, Ordering::SeqCst);
+        return;
+    }
+
+    let _ = toolbar_apply_state(toolbar, tabs, current);
 }
 
 fn plum_protocol(_id: WebViewId, req: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
@@ -1011,13 +1034,22 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
       background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1);
       border-radius:28px; padding:6px 8px 6px 18px;
       box-shadow:0 8px 32px rgba(0,0,0,0.25);
+      position:relative;
     }
     .search-box:focus-within { border-color:rgba(138,180,248,0.55); }
     .search-box input {
       flex:1; border:none; outline:none; background:transparent;
-      color:var(--fg); font:inherit; padding:10px 0;
+      color:var(--fg); font:inherit; padding:10px 36px 10px 0;
     }
     .search-box input::placeholder { color:var(--mut); }
+    .search-clear {
+      position:absolute; right:12px; top:50%; transform:translateY(-50%);
+      width:24px; height:24px; border:none; border-radius:12px;
+      background:transparent; color:var(--mut); font-size:18px; line-height:1;
+      display:none; place-items:center; cursor:pointer; padding:0;
+    }
+    .search-clear.visible { display:grid; }
+    .search-clear:hover { background:rgba(255,255,255,0.08); color:var(--fg); }
     .hint { margin-top:18px; color:var(--mut); font-size:14px; text-align:center; }
   </style>
 </head>
@@ -1027,6 +1059,7 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
     <div class="search-box">
       <input id="search" type="text" autocomplete="off" spellcheck="false"
         placeholder="Введите адрес или выполните поиск" autofocus />
+      <button type="button" class="search-clear" id="search-clear" title="Очистить">×</button>
     </div>
   </form>
   <div class="hint">Или используйте строку адреса вверху окна</div>
@@ -1053,6 +1086,27 @@ const NEWTAB_HTML: &str = r#"<!doctype html>
       e.preventDefault();
       navigate(document.getElementById('search').value);
     });
+    var searchInput = document.getElementById('search');
+    var searchClear = document.getElementById('search-clear');
+    function syncSearchClear() {
+      if (searchClear && searchInput) {
+        searchClear.classList.toggle('visible', !!searchInput.value);
+      }
+    }
+    if (searchClear) {
+      searchClear.addEventListener('click', function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (searchInput) {
+          searchInput.value = '';
+          syncSearchClear();
+          searchInput.focus();
+        }
+      });
+    }
+    if (searchInput) {
+      searchInput.addEventListener('input', syncSearchClear);
+    }
   </script>
 </body>
 </html>
@@ -1211,8 +1265,8 @@ const TOOLBAR_SCRIPT: &str = r#"
         const gap = TAB_GAP;
         strip.classList.remove('scroll');
 
-        const minTotal = n * TAB_MIN + Math.max(0, n - 1) * gap;
-        if (minTotal > avail) {
+        const minTotalScroll = n * TAB_MIN;
+        if (minTotalScroll > avail) {
           strip.classList.add('scroll');
           tabs.forEach(t => {
             t.style.flex = '0 0 32px';
@@ -1220,6 +1274,7 @@ const TOOLBAR_SCRIPT: &str = r#"
             t.style.minWidth = '32px';
             t.style.maxWidth = '32px';
             t.style.height = '32px';
+            t.style.margin = '0';
           });
           const active = strip.querySelector('.tab.active');
           if (active) active.scrollIntoView({ inline: 'nearest', block: 'nearest' });
@@ -1275,7 +1330,12 @@ const TOOLBAR_SCRIPT: &str = r#"
         const x = document.createElement('div');
         x.className = 'tab-close';
         x.textContent = '×';
-        x.onclick = (e) => { e.stopPropagation(); post('close_tab:' + tabId); };
+        x.onmousedown = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          post('close_tab:' + tabId);
+        };
+        x.onclick = (e) => { e.stopPropagation(); };
 
         t.appendChild(icon);
         t.appendChild(tt);
@@ -1315,17 +1375,24 @@ const TOOLBAR_SCRIPT: &str = r#"
 const TAB_BAR_CSS: &str = r#"
     body { user-select:none; -webkit-user-select:none; }
     input { user-select:text; -webkit-user-select:text; }
-    .tabs-bar { display:flex; align-items:center; gap:8px; height:32px; min-height:32px; width:100%; }
+    .tabs-bar {
+      display:flex; align-items:flex-start; gap:8px;
+      height:40px; min-height:40px; max-height:40px;
+      width:100%; padding-top:4px; box-sizing:border-box;
+    }
     .tab-strip {
-      display:flex; gap:8px; align-items:center;
+      display:flex; gap:8px; align-items:flex-start;
       flex:1 1 auto; min-width:48px;
-      height:32px;
+      height:36px;
       overflow-x:auto; overflow-y:hidden;
       scrollbar-width:thin; scrollbar-color:#5f6368 transparent;
+      box-sizing:border-box;
     }
-    .tab-strip::-webkit-scrollbar { height:4px; }
-    .tab-strip::-webkit-scrollbar-thumb { background:#5f6368; border-radius:8px; }
-    .tab-strip::-webkit-scrollbar-track { background:transparent; }
+    .tab-strip.scroll { gap:0 !important; }
+    .tab-strip::-webkit-scrollbar { height:2px; }
+    .tab-strip:hover::-webkit-scrollbar { height:4px; }
+    .tab-strip::-webkit-scrollbar-thumb { background:#5f6368; border-radius:4px; }
+    .tab-strip::-webkit-scrollbar-track { background:transparent; margin-top:2px; }
     .addtab {
       width:36px; height:32px; border-radius:12px; background:var(--b);
       display:grid; place-items:center; cursor:pointer; user-select:none;
@@ -1352,21 +1419,22 @@ const TAB_BAR_CSS: &str = r#"
       cursor:pointer;
       opacity:0; pointer-events:none;
     }
-    .tab:hover .tab-close { opacity:1; pointer-events:auto; }
+    .tab:hover .tab-close, .tab.active .tab-close { opacity:1; pointer-events:auto; }
     .tab-close:hover { background:#2a2b2f; color:var(--fg); }
     .tab-strip.scroll .tab-title { display:none; }
     .tab-strip.scroll .tab {
-      padding:0; width:32px !important; min-width:32px !important; max-width:32px !important;
-      height:32px; border-radius:8px; display:flex; align-items:center; justify-content:center;
-      flex:0 0 32px !important;
+      padding:0 !important; width:32px !important; min-width:32px !important; max-width:32px !important;
+      height:32px !important; border-radius:8px; display:flex; align-items:center; justify-content:center;
+      flex:0 0 32px !important; border:none; margin:0; gap:0;
     }
     .tab-strip.scroll .tab-icon { width:16px; height:16px; margin:0; }
     .tab-strip.scroll .tab-close {
       position:absolute; inset:0; width:32px; height:32px; margin:auto;
-      border-radius:8px;
+      border-radius:8px; right:auto; top:auto;
     }
     .tab-strip.scroll .tab:hover .tab-icon { opacity:0; }
-    .tab-strip.scroll .tab:hover .tab-close { opacity:1; pointer-events:auto; }
+    .tab-strip.scroll .tab:hover .tab-close,
+    .tab-strip.scroll .tab.active .tab-close { opacity:1; pointer-events:auto; }
     .omnibox-wrap { position:relative; flex:1; min-width:200px; display:flex; }
     .omnibox-wrap input {
       flex:1; min-width:0; padding:10px 34px 10px 14px; border-radius:16px;
@@ -1386,19 +1454,22 @@ const WINDOWS_TAB_BAR_CSS: &str = r#"
     .tabs-bar {
       display:grid;
       grid-template-columns:minmax(0,1fr) 36px;
-      align-items:center;
+      align-items:start;
       gap:8px;
-      height:32px;
-      min-height:32px;
+      height:40px;
+      min-height:40px;
+      max-height:40px;
+      padding-top:4px;
       width:100%;
+      box-sizing:border-box;
     }
     .tab-strip {
       grid-column:1;
       min-width:0;
       width:100%;
     }
-    #addtab-inline { grid-column:2; }
-    #addtab-fixed { grid-column:2; }
+    #addtab-inline { grid-column:2; align-self:start; }
+    #addtab-fixed { grid-column:2; align-self:start; }
     .toolbar { position:relative; }
 "#;
 
@@ -1737,7 +1808,9 @@ fn build_content_webview(
 ) -> WebView {
     #[cfg(target_os = "windows")]
     let content_init = format!("{CONTENT_SHORTCUT_SCRIPT}\n{WIN_CONTENT_CONTEXT_SCRIPT}");
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    let content_init = format!("{CONTENT_SHORTCUT_SCRIPT}\n{MAC_EDIT_SCRIPT}");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let content_init = CONTENT_SHORTCUT_SCRIPT.to_string();
 
     let builder = WebViewBuilder::new()
@@ -1855,8 +1928,13 @@ fn show_tab(
         }
     }
     if devtools_open {
+        #[cfg(not(target_os = "windows"))]
         if let Some(tab) = tabs.get(current) {
             open_docked_devtools(&tab.webview);
+        }
+        #[cfg(target_os = "windows")]
+        if let (Some(panel), Some(tab)) = (devtools_panel, tabs.get(current)) {
+            sync_windows_devtools(panel, tab, true);
         }
     }
     focus_active_tab(tabs, current);
@@ -1922,14 +2000,34 @@ fn toggle_devtools(
 
     #[cfg(target_os = "windows")]
     {
-        let _ = (window, toolbar, ww, wh, devtools_panel);
         if *devtools_open {
-            close_docked_devtools(&tab.webview);
+            if let Some(panel) = devtools_panel {
+                sync_windows_devtools(panel, tab, false);
+            }
+            cancel_devtools_panel_request();
             *devtools_open = false;
         } else {
-            open_docked_devtools(&tab.webview);
             *devtools_open = true;
+            request_devtools_panel();
+            if let Some(panel) = devtools_panel {
+                sync_windows_devtools(panel, tab, true);
+            }
         }
+        resize_all(
+            window,
+            toolbar,
+            tabs,
+            ww,
+            wh,
+            *devtools_open,
+            devtools_panel,
+        );
+        raise_toolbar(
+            toolbar,
+            window,
+            Some(tabs),
+            devtools_panel,
+        );
         focus_active_tab(tabs, current);
         return;
     }
@@ -2018,11 +2116,16 @@ fn macos_edit_from_key(key: KeyCode, super_key: bool) -> Option<MacEditCommand> 
 }
 
 fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> WebView {
-    #[cfg(not(target_os = "windows"))]
-    let proxy_page = proxy.clone();
+    let proxy_ready = proxy.clone();
     let proxy_ipc = proxy.clone();
     #[cfg(not(target_os = "windows"))]
     let proxy_nav = proxy.clone();
+
+    #[cfg(target_os = "macos")]
+    let toolbar_init = format!("{TOOLBAR_LOCK_SCRIPT}\n{MAC_EDIT_SCRIPT}");
+    #[cfg(not(target_os = "macos"))]
+    let toolbar_init = TOOLBAR_LOCK_SCRIPT.to_string();
+
     let builder = WebViewBuilder::new()
         .with_bounds(bounds_toolbar(ww))
         .with_background_color(TOOLBAR_BG)
@@ -2034,7 +2137,7 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         .with_hotkeys_zoom(false)
         .with_back_forward_navigation_gestures(false)
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
-        .with_initialization_script(TOOLBAR_LOCK_SCRIPT)
+        .with_initialization_script(&toolbar_init)
         .with_navigation_handler(move |url| {
             if let Some(msg) = toolbar_ipc_from_url(&url) {
                 #[cfg(target_os = "windows")]
@@ -2049,8 +2152,7 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         })
         .with_on_page_load_handler(move |event, _| {
             if matches!(event, PageLoadEvent::Finished) {
-                #[cfg(not(target_os = "windows"))]
-                let _ = proxy_page.send_event(UserEvent::Ipc("ready".to_string()));
+                let _ = proxy_ready.send_event(UserEvent::Ipc("ready".to_string()));
             }
         })
         .with_ipc_handler(move |req: Request<String>| {
@@ -2058,12 +2160,9 @@ fn build_toolbar(window: &Window, proxy: EventLoopProxy<UserEvent>, ww: f64) -> 
         });
 
     #[cfg(target_os = "windows")]
-    let builder = {
-        let initial = ToolbarSnapshot::new_default();
-        builder
-            .with_url(&windows_toolbar_data_url(&initial))
-            .with_custom_protocol("plum".to_string(), plum_protocol)
-    };
+    let builder = builder
+        .with_html(&toolbar_html())
+        .with_custom_protocol("plum".to_string(), plum_protocol);
 
     #[cfg(not(target_os = "windows"))]
     let builder = builder.with_html(&toolbar_html());
@@ -2156,7 +2255,12 @@ fn open_new_tab(
     *current = tabs.len() - 1;
     let _ = tabs[*current].webview.set_visible(true);
     if devtools_open {
+        #[cfg(not(target_os = "windows"))]
         open_docked_devtools(&tabs[*current].webview);
+        #[cfg(target_os = "windows")]
+        if let Some(panel) = devtools_panel {
+            sync_windows_devtools(panel, &tabs[*current], true);
+        }
     }
     sync_toolbar(toolbar, tabs, *current);
     resize_all(
@@ -2403,6 +2507,19 @@ fn flush_toolbar(toolbar: &WebView) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    let script = format!(
+        "(function(){{var fn=window.__setState;if(fn){{fn({}, {}, {}, {}, {}, {});return true;}}return false;}})();",
+        json!(snap.ids),
+        json!(snap.titles),
+        json!(snap.urls),
+        snap.current,
+        json!(snap.cur_url),
+        snap.loading,
+    );
+    if toolbar.evaluate_script(&script).is_ok() {
+        log_windows_debug("sync_toolbar evaluate ok");
+        return;
+    }
     match toolbar.load_url(&windows_toolbar_data_url(&snap)) {
         Ok(()) => log_windows_debug("sync_toolbar reload ok"),
         Err(err) => log_windows_debug(&format!("sync_toolbar reload failed: {err}")),
@@ -2513,27 +2630,36 @@ fn optimistic_toolbar_new_tab(toolbar: &WebView, tabs: &[Tab], next_id: u32) {
         let mut snap = toolbar_snapshot()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        snap.ids = ids;
-        snap.titles = titles;
-        snap.urls = urls;
+        snap.ids = ids.clone();
+        snap.titles = titles.clone();
+        snap.urls = urls.clone();
         snap.current = current;
         snap.cur_url.clear();
         snap.loading = false;
-        TOOLBAR_DIRTY.store(true, Ordering::SeqCst);
-        return;
     }
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        let script = format!(
-            "window.__setState({}, {}, {}, {}, {}, false);",
-            json!(ids),
-            json!(titles),
-            json!(urls),
-            current,
-            json!(""),
-        );
-        let _ = toolbar.evaluate_script(&script);
+    let script = format!(
+        r#"(function(){{
+  var ids={ids};
+  var titles={titles};
+  var urls={urls};
+  var cur={current};
+  var url={empty};
+  if(typeof window.__setState==='function'){{
+    window.__setState(ids,titles,urls,cur,url,false);
+  }}else{{
+    window.__pendingState=[ids,titles,urls,cur,url,false];
+  }}
+}})();"#,
+        ids = json!(ids),
+        titles = json!(titles),
+        urls = json!(urls),
+        current = current,
+        empty = json!(""),
+    );
+    if toolbar.evaluate_script(&script).is_err() {
+        #[cfg(target_os = "windows")]
+        TOOLBAR_DIRTY.store(true, Ordering::SeqCst);
     }
 }
 
@@ -2545,17 +2671,6 @@ fn queue_open_tab(
     proxy: &EventLoopProxy<UserEvent>,
 ) {
     optimistic_toolbar_new_tab(toolbar, tabs, next_id);
-    #[cfg(target_os = "windows")]
-    {
-        if TOOLBAR_DIRTY.load(Ordering::SeqCst) {
-            let snap = toolbar_snapshot()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            let _ = toolbar.load_url(&windows_toolbar_data_url(&snap));
-            TOOLBAR_DIRTY.store(false, Ordering::SeqCst);
-        }
-    }
     OPEN_TAB_QUEUE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2683,24 +2798,13 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
             TOOLBAR_FOCUSED.store(true, Ordering::SeqCst);
         }
         "clear_url" => {
-            #[cfg(target_os = "windows")]
-            {
-                let mut snap = toolbar_snapshot()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                snap.cur_url.clear();
-                TOOLBAR_DIRTY.store(true, Ordering::SeqCst);
-            }
-            sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
-            #[cfg(target_os = "windows")]
-            {
-                let snap = toolbar_snapshot()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                let _ = ctx.toolbar.load_url(&windows_toolbar_data_url(&snap));
-                TOOLBAR_DIRTY.store(false, Ordering::SeqCst);
-            }
+            let _ = ctx.toolbar.evaluate_script(
+                r#"(function(){
+  var u=document.getElementById('url');
+  if(u){u.value='';var c=document.getElementById('url-clear');if(c)c.classList.remove('visible');u.focus();}
+})();"#,
+            );
+            TOOLBAR_FOCUSED.store(true, Ordering::SeqCst);
         }
         "nav_back" => {
             webview_go_back(&ctx.tabs[*ctx.current].webview);
@@ -2817,15 +2921,6 @@ fn process_ipc(msg: &str, ctx: &mut IpcContext<'_>) {
                                 ctx.devtools_panel,
                             );
                             sync_toolbar(ctx.toolbar, ctx.tabs, *ctx.current);
-                            #[cfg(target_os = "windows")]
-                            {
-                                let snap = toolbar_snapshot()
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .clone();
-                                let _ = ctx.toolbar.load_url(&windows_toolbar_data_url(&snap));
-                                TOOLBAR_DIRTY.store(false, Ordering::SeqCst);
-                            }
                         }
                     }
                 }
